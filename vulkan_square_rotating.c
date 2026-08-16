@@ -48,7 +48,7 @@
 #	define VSR_DEBUG_LOGF(format, ...)	((void) 0)
 #endif
 
-#define VSR_WINDOW_WWIDTH						800
+#define VSR_WINDOW_WIDTH						800
 #define VSR_WINDOW_HEIGHT						600
 
 #define VSR_LIMIT_FRAMES_IN_FLIGHT				2
@@ -106,7 +106,7 @@ struct VSR_Application {
 	VkDeviceMemory						buffers_uniform_memory;
 	void								* buffers_uniform_mapped_pointer;
 
-	/* auto freed with it's command pool destroying */
+	/* auto freed with its command pool destroying */
 	VkDescriptorSet						* descriptor_sets_pointer;
 	VkCommandBuffer						* command_buffers_pointer;
 	struct VSR_Synchronization_Objects	* synchronization_objects_pointer;
@@ -211,9 +211,9 @@ static const uint32_t validation_layers_amount =
 /* common */
 static void vsr_application_initialization( struct VSR_Application * restrict application_pointer );
 
-/* window scpecific */
+/* window specific */
 static void vsr_key_callback( GLFWwindow * window_pointer, int key, int scancode, int action, int mods );
-static void vsr_window_iconify_callback( GLFWwindow * window_pointer, int iconidied );
+static void vsr_window_iconify_callback( GLFWwindow * window_pointer, int iconified );
 static void vsr_frame_buffer_size_callback( GLFWwindow * window_pointer, int width, int height );
 static bool vsr_window_initialization( struct VSR_Application * restrict application_pointer );
 
@@ -489,7 +489,7 @@ static void vsr_application_initialization(
 	assert_m( application_pointer != NULL, "No application found" );
 
 	*application_pointer = (struct VSR_Application) {
-		.width					= VSR_WINDOW_WWIDTH,
+		.width					= VSR_WINDOW_WIDTH,
 		.height					= VSR_WINDOW_HEIGHT,
 		/* 2 or must be backed by swap_chain swap_chain_image_views_amount */
 		.frames_in_flight_limit	= VSR_LIMIT_FRAMES_IN_FLIGHT,
@@ -1066,7 +1066,7 @@ static bool vsr_create_uniforms_buffer( struct VSR_Application * restrict applic
 			&application_pointer->buffers_uniform_memory
 		) != VK_SUCCESS )
 	{
-		woem_push( "(vsr_create_uniforms_buffer) vertex buffer memory allocation failed" );
+		woem_push( "(vsr_create_uniforms_buffer) uniform buffer memory allocation failed" );
 		return false;
 	}
 
@@ -1097,7 +1097,7 @@ static bool vsr_create_uniforms_buffer( struct VSR_Application * restrict applic
 				application_pointer->buffers_uniform_memory, size_offset
 			) != VK_SUCCESS )
 		{
-			woem_push( "(vsr_create_uniforms_buffer) binding buffer memory  failed" );
+			woem_push( "(vsr_create_uniforms_buffer) binding buffer memory failed" );
 			return false;
 		}
 	}
@@ -1327,7 +1327,7 @@ static bool vsr_copy_buffer(
 			application_pointer->transfer_queue, 1, &submit_information, VK_NULL_HANDLE
 		) != VK_SUCCESS )
 	{
-		woem_push( "(vsr_copy_buffer) draw command buffer submition failed" );
+		woem_push( "(vsr_copy_buffer) draw command buffer submission failed" );
 		goto out;
 	}
 	vkQueueWaitIdle( application_pointer->transfer_queue );
@@ -1628,7 +1628,7 @@ cleanup_swap_chain:
 
 cleanup:
 	++application_pointer->swap_chain_recreate_failed_amount;
-	VSR_DEBUG_LOGF( "Eror: %s", error_message_pointer );
+	VSR_DEBUG_LOGF( "Error: %s", error_message_pointer );
 	return;
 }
 
@@ -2308,7 +2308,7 @@ static void vsr_draw_frame( struct VSR_Application * restrict application_pointe
 			synchronization_object_pointer->in_flight_fence
 		) != VK_SUCCESS )
 	{
-		VSR_DEBUG_LOG( "(vsr_draw_frame) draw command buffer submition failed" );
+		VSR_DEBUG_LOG( "(vsr_draw_frame) draw command buffer submission failed" );
 		application_pointer->is_swap_chain_valid = false;
 		return;
 	}
@@ -2860,7 +2860,7 @@ static bool vsr_create_shader_module(
 	)
 {
 	assert_m( device					!= VK_NULL_HANDLE,	"No device found"				);
-	assert_m( shader_code_source_pointer!= NULL,			"No shadder source found"		);
+	assert_m( shader_code_source_pointer!= NULL,			"No shader source found"		);
 	assert_m( file_size					> 0,				"No file size found"			);
 	assert_m( out_shader_module_pointer	!= NULL,			"No shader module storage found");
 
@@ -3041,7 +3041,7 @@ static bool vsr_create_swap_chain(
 		.imageFormat		= surface_format.format,
 		.imageColorSpace	= surface_format.colorSpace,
 		.imageExtent		= *out_swap_chain_extent_pointer,
-		.imageArrayLayers	= 1, /* image consist of this amount of layers */
+		.imageArrayLayers	= 1, /* image consists of this amount of layers */
 		.imageUsage			= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 		.preTransform		= swap_chain_support.surface_capabilities.currentTransform,
 		.compositeAlpha		= VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -3404,7 +3404,7 @@ static struct VkExtensionProperties * vsr_get_available_extensions(
 	{
 		woem_push(
 			"(vsr_get_available_extensions) "
-			"Vulkan Enumaration the Number of Instance Extension Properties failed"
+			"Vulkan Enumeration the Number of Instance Extension Properties failed"
 		);
 		return NULL;
 	}
@@ -3425,7 +3425,7 @@ static struct VkExtensionProperties * vsr_get_available_extensions(
 		free( extensions );
 		woem_push(
 			"(vsr_get_available_extensions) "
-			"Vulkan Enumaration of Instance Extension Properties failed"
+			"Vulkan Enumeration of Instance Extension Properties failed"
 		);
 		return NULL;
 	}
@@ -3566,14 +3566,14 @@ static bool vsr_window_initialization( struct VSR_Application * restrict applica
 	assert_m( application_pointer != NULL, "No application found" );
 
 	if ( glfwInit() != GLFW_TRUE ) {
-		woem_push( "(vsr_window_initialization) GLFW initializatino failed" );
+		woem_push( "(vsr_window_initialization) GLFW initialization failed" );
 		return false;
 	}
 
 	glfwWindowHint( GLFW_CLIENT_API, GLFW_NO_API );
 
 	application_pointer->window_pointer = glfwCreateWindow(
-		VSR_WINDOW_WWIDTH, VSR_WINDOW_HEIGHT, "VULKAN SQUARE ROTATION", NULL, NULL
+		VSR_WINDOW_WIDTH, VSR_WINDOW_HEIGHT, "VULKAN SQUARE ROTATION", NULL, NULL
 	);
 	if ( application_pointer->window_pointer == NULL ) {
 		woem_push( "(vsr_window_initialization) window creation failed" );
