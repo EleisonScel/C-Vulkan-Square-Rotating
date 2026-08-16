@@ -3573,7 +3573,7 @@ static bool vsr_window_initialization( struct VSR_Application * restrict applica
 	glfwWindowHint( GLFW_CLIENT_API, GLFW_NO_API );
 
 	application_pointer->window_pointer = glfwCreateWindow(
-		VSR_WINDOW_WWIDTH, VSR_WINDOW_HEIGHT, "VULKAN", NULL, NULL
+		VSR_WINDOW_WWIDTH, VSR_WINDOW_HEIGHT, "VULKAN SQUARE ROTATION", NULL, NULL
 	);
 	if ( application_pointer->window_pointer == NULL ) {
 		woem_push( "(vsr_window_initialization) window creation failed" );
