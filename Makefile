@@ -1,5 +1,5 @@
-PATH_TOOLCHAIN				=
-PATH_VULKAN					=
+PATH_TOOLCHAIN				= D:/Programs/msys64/ucrt64
+PATH_VULKAN					= D:/Programs/VulkanSDK
 
 COMPILER_C					= gcc
 COMPILER_GLSL				= $(PATH_VULKAN)/Bin/glslc.exe
@@ -19,9 +19,8 @@ DIRICTORY_LIBRARY			= -L$(PATH_TOOLCHAIN)/lib
 FLAGS_WARNINGS	= -Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -Wshadow		\
 					-Wcast-align -Wstrict-prototypes -Wmissing-prototypes -Wredundant-decls		\
 					-Wmissing-declarations -Wold-style-definition -Wnull-dereference -Wcast-qual\
-					-Wwrite-strings -Wpointer-arith -Wundef -Wno-float-equal -Wjump-misses-init \
-					-Wformat-security -Wvla -Wdouble-promotion -Wmissing-include-dirs			\
-					-Wmissing-field-initializers
+					-Wwrite-strings -Wpointer-arith -Wundef -Wno-float-equal -Wformat-security	\
+					-Wvla -Wdouble-promotion -Wmissing-include-dirs -Wmissing-field-initializers
 
 FLAGS_SPEED				= -march=native -funroll-loops -fuse-linker-plugin -flto -O2
 FLAGS_SAVE				= -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=2
