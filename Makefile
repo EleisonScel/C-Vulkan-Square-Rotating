@@ -1,5 +1,5 @@
-PATH_TOOLCHAIN				= D:/Programs/msys64/ucrt64
-PATH_VULKAN					= D:/Programs/VulkanSDK
+PATH_TOOLCHAIN				=
+PATH_VULKAN					=
 
 COMPILER_C					= gcc
 COMPILER_GLSL				= $(PATH_VULKAN)/Bin/glslc.exe
