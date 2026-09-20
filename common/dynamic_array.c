@@ -65,14 +65,15 @@ bool da_dynamic_array_shrink(
 	}
 
 	void * new_pointer = realloc( current_data_pointer, amount * item_size );
-	if ( new_pointer != NULL ) {
-		memcpy(
-			data_pointer,
-			&new_pointer,
-			sizeof( new_pointer )
-		);
-		*capacity_pointer	= amount;
-	}
+	if ( new_pointer == NULL )
+		return false;
+
+	memcpy(
+		data_pointer,
+		&new_pointer,
+		sizeof( new_pointer )
+	);
+	*capacity_pointer	= amount;
 
 	return true;
 }
@@ -83,8 +84,8 @@ bool da_dynamic_array_ensure_capacity(
 	)
 {
 	if( assert_check_m( item_size != 0, "Element size can not be zero"	) == false ||
-		assert_check_m( data_pointer != NULL, "No array found"			) == false ||
-		assert_check_m( capacity_pointer != NULL, "Capacity isn't found") == false ||
+		assert_check_m( data_pointer	!= NULL, "No array found"		) == false ||
+		assert_check_m( capacity_pointer!= NULL, "Capacity isn't found"	) == false ||
 		assert_check_m(*capacity_pointer > 0 || base_amount > 0,
 			"Base amount and capacity are both zero"					) == false)
 		return false;
@@ -243,16 +244,26 @@ static bool da_dynamic_array_expand_list(
 	}
 
 	for( size_t list_index = 0; list_index < list_amount; ++list_index ) {
-		void ** data_pointer = (void **) list_pointer[list_index].data_pointer;
 		assert_m( list_pointer[list_index].item_size != 0, "Item size shall not be 0" );
-		void * temporary_pointer =
-			realloc( *data_pointer, capacity_target * list_pointer[list_index].item_size );
+		void * data_pointer_current = NULL;
+		memcpy(
+			&data_pointer_current,
+			list_pointer[list_index].data_pointer,
+			sizeof( data_pointer_current )
+		);
+		void * temporary_pointer = realloc(
+			data_pointer_current, capacity_target * list_pointer[list_index].item_size
+		);
 		if ( temporary_pointer == NULL )
 		{
 			da_dynamic_array_restore_all( list_pointer, list_index, capacity_old );
 			return false;
 		}
-		*data_pointer = temporary_pointer;
+		memcpy(
+			list_pointer[list_index].data_pointer,
+			&temporary_pointer,
+			sizeof( temporary_pointer )
+		);
 	}
 	return true;
 }
@@ -274,15 +285,31 @@ static void da_dynamic_array_restore_all(
 	assert_m( list_amount	> 0,		"Arrays to check shall be positive amount"	);
 
 	for ( size_t list_index = 0; list_index < list_amount; ++list_index ) {
-		void ** data_pointer = (void **)list_pointer[list_index].data_pointer;
+		void * data_pointer_current = NULL;
+		memcpy(
+			&data_pointer_current,
+			list_pointer[list_index].data_pointer,
+			sizeof( data_pointer_current )
+		);
 		if ( capacity_target != 0 ) {
 			assert_m( list_pointer[list_index].item_size != 0, "Item size shall not be 0" );
-			void * temporary_pointer =
-				realloc( *data_pointer, capacity_target * list_pointer[list_index].item_size );
-			if ( temporary_pointer != NULL ) *data_pointer = temporary_pointer;
+			void * temporary_pointer = realloc(
+				data_pointer_current, capacity_target * list_pointer[list_index].item_size
+			);
+			if ( temporary_pointer != NULL )
+				memcpy(
+					list_pointer[list_index].data_pointer,
+					&temporary_pointer,
+					sizeof( temporary_pointer )
+				);
 		} else {
-			free( *data_pointer );
-			*data_pointer = NULL;
+			free( data_pointer_current );
+			data_pointer_current = NULL;
+			memcpy(
+				list_pointer[list_index].data_pointer,
+				&data_pointer_current,
+				sizeof( data_pointer_current )
+			);
 		}
 	}
 }

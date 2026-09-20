@@ -18,10 +18,13 @@
 #include "dynamic_array.h"	/* da_dynamic_array_shrink	*/
 #include "assert_m.h"		/* assert_m					*/
 
+#include <limits.h>	/* INT_MAX	*/
+
 #include <stdio.h>	/* vsnprintf*/
 #include <stdarg.h>	/* va_list	*/
 #include <stddef.h>	/* size_t	*/
 #include <stdlib.h>	/* malloc	*/
+#include <stdint.h> /* SIZE_MAX */
 #include <stdbool.h>/* bool		*/
 
 #define WOEM_STATIC_CAPACITY	8
@@ -114,20 +117,13 @@ void woem_shrink(void) {
 		current_error_handle.amount <= WOEM_STATIC_CAPACITY )
 		return;
 
-	/* da_dynamic_array_shrink return false only on invalid arguments,			*
-	 * which is a programmer error. If realloc failed to reduce memory block,	*
-	 * it keeps the original memory untouched and returns true;					*
-	 * This return value may be safely ignored.									*
-	 */
-	bool result = da_dynamic_array_shrink(
+	(void) da_dynamic_array_shrink(
 		&current_error_handle.dynamic_array,
 		sizeof( *current_error_handle.dynamic_array ),
 		&current_error_handle.dynamic_capacity,
 		current_error_handle.amount - WOEM_STATIC_CAPACITY,
 		WOEM_BASE_ERRORS_AMOUNT
 	);
-	assert_m( result, "Incorrect arguments to shrink and it failed" );
-	(void) result;
 }
 
 char * woem_pop( bool * restrict out_must_be_freed_pointer ) {

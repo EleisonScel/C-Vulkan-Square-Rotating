@@ -47,7 +47,7 @@ void da_dynamic_array_free( void * restrict data_pointer, size_t * restrict amou
  * base_amount		- minimal array size
  *
  * Returns:
- * false			- invalid arguments
+ * false			- invalid arguments or shrinking failed
  * true				- shrinking isn't needed or it's completed
  */
 bool da_dynamic_array_shrink( void * restrict data_pointer, size_t item_size, size_t * restrict capacity_pointer, size_t amount, size_t base_amount );

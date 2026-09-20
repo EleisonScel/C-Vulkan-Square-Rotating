@@ -57,7 +57,7 @@ void * rb_ring_buffer_pop( struct RB_Ring_Buffer * restrict ring_buffer_pointer 
  *
  * Returns:
  * pointer				- pointer of the first element gotten successfully
- * NULL					- invalid arguments
+ * NULL					- invalid arguments, empty buffer
  */
 void * rb_ring_buffer_peek( const struct RB_Ring_Buffer * restrict ring_buffer_pointer );
 /* Function:
@@ -84,11 +84,11 @@ void * rb_ring_buffer_peek_position( const struct RB_Ring_Buffer * restrict ring
  *
  * Parameters:
  * ring_buffer_pointer	- ring buffer pointer
- * data_pointer			- pointer to the data to push
+ * data_pointer			- pointer to the data to push; shall NOT point into the ring buffer storage
  *
  * Returns:
  * true					- element pushed successfully
- * false				- invalid arguments
+ * false				- invalid arguments, buffer is full
  */
 bool rb_ring_buffer_push( struct RB_Ring_Buffer * restrict ring_buffer_pointer, const void * restrict data_pointer );
 /* Function:
@@ -222,7 +222,8 @@ bool rb_ring_buffer_shrink( struct RB_Ring_Buffer * restrict ring_buffer_pointer
  * capacity_minimal			- minimal capacity of the ring buffer
  *
  * Returns:
- * true						- ring buffer initialized successfully
+ * true						- valid arguments;
+ *								out_ring_buffer_pointer depends on memory allocation result
  * false					- invalid arguments, overflow, incorrect state
  */
 bool rb_ring_buffer_create( struct RB_Ring_Buffer * restrict * restrict out_ring_buffer_pointer, size_t element_size, size_t capacity_desired, size_t capacity_minimal );
