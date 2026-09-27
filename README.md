@@ -1,6 +1,6 @@
 # Vulkan Square Rotation
 
-A simple ~11'000 lines C Vulkan application that renders a rotating square (6.5k utilities, 4.5k Vulkan). Created while exploring the Vulkan API.
+A simple ~12'500 lines C Vulkan application that renders a rotating square (7.5k utilities, 5k Vulkan). Created while exploring the Vulkan API.
 
 # Demonstration
 ![Vulkan Square Rotation](assets/vulkan_square_rotating.gif)
