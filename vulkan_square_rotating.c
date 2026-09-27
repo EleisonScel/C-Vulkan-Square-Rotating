@@ -1747,7 +1747,9 @@ static const char * vsr_buffer_copy(
 		goto out;
 	}
 
-	vsr_buffer_ownership_acquire(application_pointer, buffer_destination, size);
+	error_message_pointer = vsr_buffer_ownership_acquire(
+		application_pointer, buffer_destination, size
+	);
 
 out:
 	vkFreeCommandBuffers( application_pointer->device, command_pool, 1, &command_buffer );
