@@ -2582,7 +2582,7 @@ static bool vsr_device_extensions_get(
 		{
 			assert_mf(0, "extensions amount (%u) overflow", out_extensions_pointer->amount );
 			return false;
-		} else if(	out_extensions_pointer->data_pointer == NULL )
+		} else if( out_extensions_pointer->data_pointer == NULL )
 			return false;
 	}
 	if(	vkEnumerateDeviceExtensionProperties(
