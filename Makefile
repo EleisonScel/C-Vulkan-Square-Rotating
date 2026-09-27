@@ -20,7 +20,8 @@ FLAGS_WARNINGS	= -Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion
 					-Wcast-align -Wstrict-prototypes -Wmissing-prototypes -Wredundant-decls		\
 					-Wmissing-declarations -Wold-style-definition -Wnull-dereference -Wcast-qual\
 					-Wwrite-strings -Wpointer-arith -Wundef -Wno-float-equal -Wformat-security	\
-					-Wvla -Wdouble-promotion -Wmissing-include-dirs -Wmissing-field-initializers
+					-Wvla -Wdouble-promotion -Wmissing-include-dirs -Wmissing-field-initializers\
+					-Wformat=2 -Wduplicated-cond -Wduplicated-branches -Wlogical-op
 
 FLAGS_SPEED				= -march=native -funroll-loops -fuse-linker-plugin -flto -O2
 FLAGS_SAVE				= -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=2
@@ -31,7 +32,7 @@ FLAGS_DEBUG				= $(FLAGS_BASE) $(FLAGS_WARNINGS) -g -O0
 FLAGS_RELEASE			= $(FLAGS_BASE) $(FLAGS_WARNINGS) $(FLAGS_SAVE) $(FLAGS_SPEED) -DNDEBUG
 
 
-FLAGS_LIBRARIES_BASE	= $(DIRICTORY_LIBRARY) -lglfw3 -lopengl32 -lglew32 -lvulkan-1
+FLAGS_LIBRARIES_BASE	= $(DIRICTORY_LIBRARY) -lglfw3 -lvulkan-1
 FLAGS_LIBRARIES_DEBUG	= $(FLAGS_LIBRARIES_BASE)
 FLAGS_LIBRARIES_RELEASE	= $(FLAGS_LIBRARIES_BASE) -mwindows
 
@@ -53,4 +54,3 @@ $(FILE_SHADER_VERTEX_OBJECT): $(FILE_SHADER_VERTEX_SOURCE)
 
 debug release: $(FILE_SHADER_VERTEX_OBJECT) $(FILE_SHADER_FRAGMENT_OBJECT)
 	$(COMPILER_C) $(DIRICTORY_SOURCES) -o $(FILE_RESULT) $(FLAGS_TO_COMPILE) $(FLAGS_LIBRARIES)
-

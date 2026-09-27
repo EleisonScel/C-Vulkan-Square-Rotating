@@ -20,6 +20,7 @@
 #include "common/ring_buffer.h"
 #include "common/handle_file.h"
 #include "common/clamp_values.h"
+#include "common/vulkan_wrapped.h"
 #include "common/aligned_memory.h"
 #include "common/cleanup_register.h"
 #include "common/safe_multiplication.h"
@@ -30,10 +31,12 @@
 
 #include <cglm/cglm.h>	/* glm_rad	*/
 
-#include <pthread.h>	/* pthread_		*/
-#include <inttypes.h>	/* PRIu64		*/
+#include <pthread.h>	/* pthread_	*/
+#include <limits.h>		/* INT_MAX	*/
+#include <math.h>		/* fminf	*/
 
 #include <stdio.h>		/* fprintf				*/
+#include <stddef.h>		/* offsetof				*/
 #include <string.h>		/* strcmp				*/
 #include <stdlib.h>		/* EXIT_STATUS			*/
 #include <stdint.h>		/* uint32_t				*/
@@ -45,28 +48,52 @@
 #	define VSR_DEBUG_LOGF(format, ...)	fprintf( stderr, (format"\n"), __VA_ARGS__ )
 #else
 #	define VSR_DEBUG_LOG(format)		((void) 0)
-#	define VSR_DEBUG_LOGF(format, ...)	((void) 0)
+#	define VSR_DEBUG_LOGF(format, ...) \
+	do { if(0) fprintf( stderr, (format"\n"), __VA_ARGS__ ); } while(0)
 #endif
 
-#define VSR_WINDOW_WIDTH						80
-#define VSR_WINDOW_HEIGHT						60
+#define VSR_WINDOW_WIDTH							800
+#define VSR_WINDOW_HEIGHT							600
 
-#define VSR_SPIN_ANGLE_ROTATION					0.02f
+#define VSR_LIMIT_TURNOVER							6.2831853071f
+#define VSR_SPIN_ANGLE_ROTATION						(VSR_LIMIT_TURNOVER / 256.f)
 
-#define VSR_RESIZE_SETTLE_SECONDS				0.1
-#define VSR_RESIZE_INVALID_FACTOR				4
+#define VSR_RESIZE_SETTLE_SECONDS					0.1
+#define VSR_RESIZE_INVALID_FACTOR					4
+#define VSR_LIMIT_EXTENT_MAXIMAL					(UINT32_MAX / VSR_RESIZE_INVALID_FACTOR)
 
-#define VSR_EXTENSION_GROUPS_AMOUNT_INSTANCE	2
-#define VSR_EXTENSION_GROUPS_AMOUNT_DEVICE		2
-#define VSR_LIMIT_FRAMES_IN_FLIGHT				2
-#define VSR_QUEUE_FAMILIES_AMOUNT				3
-#define VSR_LIMIT_SWAPCHAIN_RECREATE_FAILURES	16
-#define VSR_LIMIT_STACK_FAMILIES				64
-#define VSR_LIMIT_STACK_EXTENSIONS				128
-#define VSR_LIMIT_STACK_DELETION_QUEUE			256
+#define VSR_MINIMUM_OF_MAXIMAL_IMAGE_DIMENSION_2D	4096
 
 static_assert_m(
+	VSR_LIMIT_EXTENT_MAXIMAL >= VSR_MINIMUM_OF_MAXIMAL_IMAGE_DIMENSION_2D,
+	"extent limit shall not go below Vulkan specification minimum"
+);
+
+#define VSR_ATTACHMENT_COLOR_AMOUNT					1
+#define VSR_EXTENSION_GROUPS_AMOUNT_INSTANCE		2
+#define VSR_EXTENSION_GROUPS_AMOUNT_DEVICE			2
+#define VSR_LIMIT_FRAMES_IN_FLIGHT					2
+#define VSR_QUEUE_FAMILIES_AMOUNT					3
+#define VSR_LIMIT_IMAGE_ACQUIRE_ATTEMPTS			16
+#define VSR_LIMIT_FAILURES_SWAPCHAIN_RECREATE		16
+#define VSR_LIMIT_FAILURES_FRAME_DISCARD			60
+#define VSR_LIMIT_STACK_FAMILIES					64
+#define VSR_LIMIT_STACK_EXTENSIONS					128
+#define VSR_LIMIT_STACK_DELETION_QUEUE				256
+#define VSR_LIMIT_TIME_WAIT_ACQUIRE					1000000000ULL /* 1	second	*/
+#define VSR_LIMIT_TIME_WAIT_FENCE					10000000000ULL/* 10	seconds	*/
+
+#define VSR_SPIRV_MAGIC_RECOGNITION_NUMBER			0x07230203
+
+static_assert_m(
+	VSR_LIMIT_FRAMES_IN_FLIGHT <= UINT32_MAX / 2,
+	"frames in flight limit must not exceed half of uint32_t for a wrap-aware deletion"
+);
+static_assert_m(
 	VK_MAX_MEMORY_TYPES <= 32, "Current max memory types allow undefined behavior"
+);
+static_assert_m(
+	INT_MAX <= UINT32_MAX, "Positive integer must fit into uint32_t for frame buffer extent cast"
 );
 
 struct VSR_Extension_Names {
@@ -119,6 +146,8 @@ struct VSR_Deletion_Entity {
 	VkFramebuffer	* swap_chain_frame_buffer_pointer;
 	VkFramebuffer	swap_chain_frame_buffer;
 	VkSwapchainKHR	swap_chain;
+	/* NULL on maintenance_1 or image_views_amount */
+	VkSemaphore		* render_finished_semaphores_pointer;
 	uint32_t		image_views_amount;
 	uint32_t		delete_frame;
 };
@@ -131,11 +160,9 @@ struct VSR_Swap_Chain_Support_Details {
 	struct VkSurfaceCapabilitiesKHR	surface_capabilities;
 };
 
-struct VSR_Synchronization_Objects {
+struct VSR_Synchronization_Frame {
 	VkSemaphore	image_available_semaphore;
-	VkSemaphore	render_finished_semaphore;
 	VkFence		in_flight_fence;
-	VkFence		present_fence;
 };
 
 /* always must be changed with swap_chain_image_views_pointer */
@@ -146,7 +173,7 @@ struct VSR_Swap_Chain_Data {
 	uint32_t			image_views_amount;
 	struct VkExtent2D	extent;
 	VkFormat			image_format;
-	/* image_views_amount if imageless frame buffer isn't available or NULL */
+	/* image_views_amount on maintenance_1 or NULL */
 	VkFramebuffer		* frame_buffers_pointer;
 };
 
@@ -158,13 +185,15 @@ struct VSR_Frame_State {
 };
 
 struct VSR_Capabilities_Vulkan {
-	PFN_vkGetPhysicalDeviceFeatures2KHR	get_physical_device_features_2;
-	bool								has_get_physical_device_properties_2;
-	bool								has_surface_maintenance_1;
+	PFN_vkGetPhysicalDeviceFeatures2KHR				get_physical_device_features_2;
+	PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR	get_physical_device_surface_capabilities_2;
+	bool											has_get_physical_device_properties_2;
+	bool											has_surface_maintenance_1;
 };
 
 struct VSR_Capabilities_Device {
 	bool has_swapchain_maintenance_1;
+	bool has_present_scaling_stretch;
 	bool has_imageless_frame_buffer;
 };
 
@@ -185,12 +214,20 @@ struct VSR_Application {
 	VkDeviceMemory						buffers_uniform_memory;
 	void								* buffers_uniform_mapped_pointer;
 
-	/* auto freed with its command pool destroying */
+	/* handles are auto freed with its command pool destroying */
 	VkDescriptorSet						* descriptor_sets_pointer;
 	VkCommandBuffer						* command_buffers_pointer;
-	struct VSR_Synchronization_Objects	* synchronization_objects_pointer;
 
-	VkDeviceSize						buffer_uniform_alignment_size;
+	/* frames_in_flight_limit */
+	struct VSR_Synchronization_Frame	* synchronization_frame_pointer;
+	/* render_finished_semaphores_amount */
+	VkSemaphore							* render_finished_semaphores_pointer;
+	uint32_t							render_finished_semaphores_amount;
+	/* frames_in_flight_limit on maintenance_1 or NULL */
+	VkFence								* present_fences_pointer;
+
+	VkDeviceSize						buffer_uniform_size_alignment;
+	VkDeviceSize						buffer_uniform_size_flush;
 	VkDeviceSize						buffer_uniform_size;
 	mat4								cached_view, cached_projection, cached_projection_view;
 
@@ -201,6 +238,7 @@ struct VSR_Application {
 	uint8_t								current_frame;
 	bool								is_buffer_uniform_coherent;
 	atomic_bool							is_swap_chain_valid;
+	atomic_bool							is_render_failed;
 	bool								is_minimized;
 	bool								is_running;
 	struct VSR_Frame_State				frame_state;
@@ -209,6 +247,7 @@ struct VSR_Application {
 	VkImageView							* swap_chain_image_views_pointer;/*image count backed*/
 	uint32_t							frame_counter;
 	uint32_t							swap_chain_recreate_failed_amount;
+	uint32_t							frame_discarded_amount;
 	struct RB_Ring_Buffer				deletion_queue;
 	struct VSR_Deletion_Entity			deletion_entities[VSR_LIMIT_STACK_DELETION_QUEUE];
 	pthread_t							render_thread;
@@ -228,6 +267,7 @@ struct VSR_Application {
 	VkDeviceMemory						buffer_memory_vertex;
 	VkDeviceMemory						buffer_memory_index;
 	VkPhysicalDeviceMemoryProperties	memory_properties;
+	uint32_t							image_dimension_2d_maximal;
 	VkDescriptorPool					descriptor_pool;
 	VkDescriptorSetLayout				descriptor_set_layout;
 	struct VSR_Queue_Family_Indices		queue_family_indices;
@@ -240,6 +280,14 @@ struct VSR_Application {
 	bool								is_debug_messenger_established;
 	VkDebugUtilsMessengerEXT			debug_messenger_function;
 #endif
+};
+
+struct VSR_Device_Candidate {
+	uint32_t						score;
+	uint32_t						image_dimension_2d_maximal;
+	VkPhysicalDevice				device;
+	struct VSR_Capabilities_Device	capabilities;
+	struct VSR_Queue_Family_Indices	queue_family_indices;
 };
 
 struct VSR_Extension_Group {
@@ -344,9 +392,10 @@ static const struct VSR_Extension_Names global_validation_layers = {
 static bool vsr_application_initialize(struct VSR_Application * restrict application_pointer);
 
 /* window specific */
-static void vsr_callback_key(GLFWwindow * window_pointer, int key, int scancode, int action, int mods);
-static void vsr_callback_window_iconify(GLFWwindow * window_pointer, int iconified);
-static void vsr_callback_frame_buffer_size(GLFWwindow * window_pointer, int width, int height);
+static void vsr_callback_glfw_key(GLFWwindow * window_pointer, int key, int scancode, int action, int mods);
+static void vsr_callback_glfw_error(int error_code, const char * description_pointer);
+static void vsr_callback_glfw_window_iconify(GLFWwindow * window_pointer, int iconified);
+static void vsr_callback_glfw_frame_buffer_size(GLFWwindow * window_pointer, int width, int height);
 static bool vsr_window_initialize(struct VSR_Application * restrict application_pointer);
 
 /* Vulkan Initialization */
@@ -362,6 +411,9 @@ static bool vsr_debug_messenger_setup(struct VSR_Application * restrict applicat
 static bool vsr_validation_layer_support_check(void);
 static VkResult vsr_debug_utils_messenger_extension_create(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT * restrict create_information_pointer, VkDebugUtilsMessengerEXT * restrict debug_messenger_pointer);
 static VKAPI_ATTR VkBool32 VKAPI_CALL vsr_debug_callback_function(VkDebugUtilsMessageSeverityFlagBitsEXT message_severity, VkDebugUtilsMessageTypeFlagsEXT message_type, const VkDebugUtilsMessengerCallbackDataEXT * restrict data_callback_pointer, void * restrict data_user_pointer);
+static void vsr_debug_gpu_print(VkPhysicalDeviceProperties device_properties, struct VSR_Capabilities_Device capabilities_device, uint32_t scores);
+static inline const char * vsr_debug_device_type_print(const VkPhysicalDeviceType device_type);
+static inline const char * vsr_debug_maintainability_print(bool flag);
 #endif
 
 /* extensions lists */
@@ -377,31 +429,38 @@ static inline bool vsr_extensions_available_check(const struct VSR_Extension_Nam
 static inline bool vsr_instance_extensions_required_check(const struct VSR_Extension_Names extensions_required, const struct VSR_Extension_Properties extensions_available);
 static inline struct VSR_Extension_Properties vsr_extension_properties_freeze(const struct VSR_Extension_Properties_Mutable array_extension_properties_mutable);
 /* pick up GPUs */
-static void vsr_device_extension_required_check(VkPhysicalDevice device, PFN_vkGetPhysicalDeviceFeatures2KHR funtion_get_features_2, struct VSR_Capabilities_Device * restrict out_capabilities_pointer);
+static void vsr_device_extension_required_check(VkPhysicalDevice device, PFN_vkGetPhysicalDeviceFeatures2KHR function_get_features_2, struct VSR_Capabilities_Device * restrict out_capabilities_pointer);
 static bool vsr_device_extensions_get(VkPhysicalDevice device, struct VkExtensionProperties out_extensions_array_stack[static VSR_LIMIT_STACK_EXTENSIONS], struct VSR_Extension_Properties_Mutable * restrict out_extensions_pointer);
 static bool vsr_device_physical_select(struct VSR_Application * restrict application_pointer);
-static bool vsr_device_capabilities_build(VkPhysicalDevice device, const struct VSR_Capabilities_Vulkan * restrict instance_capabilities_pointer, struct VSR_Capabilities_Device * restrict out_capabilities_device_pointer);
+static bool vsr_device_capabilities_build(VkPhysicalDevice device, VkSurfaceKHR surface, const struct VSR_Capabilities_Vulkan * restrict instance_capabilities_pointer, struct VSR_Capabilities_Device * restrict out_capabilities_device_pointer);
+static bool vsr_device_present_scaling_stretch_check(VkPhysicalDevice device, VkSurfaceKHR surface, const struct VSR_Capabilities_Vulkan * restrict instance_capabilities_pointer);
 static const char * vsr_queue_families_find(VkSurfaceKHR surface, VkPhysicalDevice device, struct VSR_Queue_Family_Indices * restrict out_queue_family_indices_pointer);
-static const char * vsr_device_suitability_rate(struct VSR_Application * restrict application_pointer, VkPhysicalDevice device, uint32_t * restrict out_scores_pointer, struct VSR_Capabilities_Device * restrict out_capabilities_device_pointer);
+static const char * vsr_device_suitability_rate(struct VSR_Application * restrict application_pointer, VkPhysicalDevice device, struct VSR_Device_Candidate * restrict out_candidate_pointer);
 static const char * vsr_surface_is_support_available(VkSurfaceKHR surface, VkPhysicalDevice device, uint32_t * restrict formats_amount_pointer, uint32_t * restrict present_modes_amount_pointer);
 static inline bool vsr_queue_family_indices_is_complete(struct VSR_Queue_Family_Indices * restrict queue_family_indices_pointer);
 /* device */
+static const char * vsr_device_create(struct VSR_Application * restrict application_pointer, void * restrict features_chain_pointer, uint32_t families_amount, struct VkDeviceQueueCreateInfo * restrict queue_create_informations_array);
 static const char * vsr_device_logical_create(struct VSR_Application * restrict application_pointer);
 static const char * vsr_device_resources_create(struct VSR_Application * restrict application_pointer);
 static bool vsr_device_recreate(struct VSR_Application * restrict application_pointer);
 /* choose a swap chain part */
 static void vsr_swap_chain_support_details_free(struct VSR_Swap_Chain_Support_Details * restrict swap_chain_support_pointer);
+static inline void vsr_swap_chain_extent_write(struct VSR_Application * restrict application_pointer, struct VkExtent2D * restrict out_extent_pointer, struct VkSurfaceCapabilitiesKHR * restrict out_surface_capabilities_pointer);
 static const char * vsr_swap_chain_create(struct VSR_Application * restrict application_pointer, struct VSR_Swap_Chain_Data * restrict out_swap_chain_data_pointer, VkImage ** restrict out_swap_chain_images_pointer);
 static const char * vsr_swap_chain_support_query(VkSurfaceKHR surface, VkPhysicalDevice device, struct VSR_Swap_Chain_Support_Details * restrict out_swap_chain_support_details_pointer);
-static struct VkExtent2D vsr_swap_extent_choose(const struct VkSurfaceCapabilitiesKHR * restrict surface_capabilities_pointer, GLFWwindow * restrict window_pointer);
+static struct VkExtent2D vsr_swap_extent_choose(const struct VkSurfaceCapabilitiesKHR * restrict surface_capabilities_pointer, uint32_t frame_buffer_width, uint32_t frame_buffer_height);
 static struct VkSurfaceFormatKHR vsr_swap_surface_format_choose(const struct VkSurfaceFormatKHR * restrict available_formats_pointer, size_t available_formats_amount);
-static inline const char * vsr_swap_chain_support_check(const struct VSR_Swap_Chain_Support_Details * restrict swap_chain_support_pointer);
-
+static inline const char * vsr_swap_chain_support_check(const struct VSR_Swap_Chain_Support_Details * restrict swap_chain_support_pointer, const uint32_t image_dimension_2d_maximal);
 /* swap chain images */
+static void vsr_image_views_destroy(VkDevice device, VkImageView * restrict image_views_pointer, uint32_t image_views_amount);
 static const char * vsr_image_views_create(struct VSR_Application * restrict application_pointer, VkImage * restrict swap_chain_images_pointer, uint32_t swap_chain_image_views_amount, VkFormat swap_chain_image_format, VkImageView ** out_swap_chain_image_views_pointer);
 /* swap chain recreation */
+static void vsr_swap_chain_recreate_data_commit(struct VSR_Application * restrict application_pointer, const struct VSR_Swap_Chain_Data * restrict swap_chain_data_pointer, VkImageView * restrict swap_chain_image_views_pointer);
 static bool vsr_swap_chain_recreate(struct VSR_Application * restrict application_pointer);
+static bool vsr_swap_chain_recreate_data(struct VSR_Application * restrict application_pointer);
 static bool vsr_swap_chain_is_extent_needs_update(struct VSR_Application * restrict application_pointer);
+static const char * vsr_swap_chain_deletion_resources_handle(struct VSR_Application * restrict application_pointer, const uint32_t image_views_amount);
+static const char * vsr_swap_chain_render_finished_semaphores_recreate(struct VSR_Application * restrict application_pointer, const uint32_t image_views_amount);
 /* render */
 static const char * vsr_render_pass_create(struct VSR_Application * restrict application_pointer);
 /* pipeline */
@@ -424,31 +483,40 @@ static const char * vsr_command_pools_create(struct VSR_Application * restrict a
 static const char * vsr_command_buffers_create(struct VSR_Application * restrict application_pointer);
 static const char * vsr_inclusive_command_pool_create(struct VSR_Application * restrict application_pointer, VkCommandPool * restrict command_pool_pointer, VkCommandPoolCreateFlags flags, uint32_t family);
 /* buffers */
+static void vsr_buffer_copy_barrier(VkCommandBuffer command_buffer, VkBuffer buffer_destination, VkDeviceSize size, uint32_t graphics_family, uint32_t transfer_family);
+static inline bool vsr_memory_type_is_coherent(const struct VSR_Application * restrict application_pointer, const uint32_t memory_type_index);
 static const char * vsr_buffer_copy(struct VSR_Application * restrict application_pointer, VkBuffer buffer_source, VkBuffer buffer_destination, VkDeviceSize size, VkCommandPool command_pool);
 static const char * vsr_buffer_create(struct VSR_Application * restrict application_pointer, VkDeviceSize size, VkBufferUsageFlags usage, const struct VSR_Memory_Levels_Requirements * restrict requirements_list, struct VSR_Buffer_Allocation_Data * restrict out_allocation_data_pointer);
 static const char * vsr_buffers_fast_create(struct VSR_Application * restrict application_pointer);
-static const char * vsr_buffer_uniform_create(struct VSR_Application * restrict application_pointer);
+static const char * vsr_buffer_uniform_create(struct VSR_Application * restrict application_pointer, const VkPhysicalDeviceProperties * restrict device_properties_pointer);
 static const char * vsr_buffer_uniforms_create(struct VSR_Application * restrict application_pointer);
 static const char * vsr_buffer_inclusive_create(struct VSR_Application * restrict application_pointer, const void * restrict buffer_pointer, VkDeviceSize buffer_size, VkBufferUsageFlags buffer_usage, struct VSR_Buffer_Allocation_Data allocation_data_staging, VkCommandPool command_pool, struct VSR_Buffer_Allocation_Data * restrict out_allocation_data_pointer);
-static inline bool vsr_memory_type_is_coherent(const struct VSR_Application * restrict application_pointer, const uint32_t memory_type_index);
+static const char * vsr_buffer_ownership_acquire(struct VSR_Application * restrict application_pointer, VkBuffer buffer_destination, VkDeviceSize size);
+static const char * vsr_buffer_ownership_acquire_record(struct VSR_Application * restrict application_pointer, VkCommandBuffer command_buffer, VkBuffer buffer_destination, VkDeviceSize size);
+static const char * vsr_buffer_ownership_acquire_submit_wait(struct VSR_Application * restrict application_pointer, VkCommandBuffer command_buffer);
 static inline const char * vsr_buffer_staging_create(struct VSR_Application * restrict application_pointer, VkDeviceSize buffer_size, struct VSR_Buffer_Allocation_Data * restrict out_allocation_data_pointer);
 /* update uniform buffer data */
-static void vsr_buffer_uniform_update(struct VSR_Application * restrict application_pointer, uint32_t current_image);
 static void vsr_projection_refresh(struct VSR_Application * restrict application_pointer);
+static bool vsr_buffer_uniform_update(struct VSR_Application * restrict application_pointer, uint32_t current_frame);
 /* binding buffer description */
 static struct VkVertexInputBindingDescription vsr_get_binding_description(void);
-/* vertex attribute description */
-static const char * vsr_get_attribute_descriptions(uint32_t * restrict out_size_pointer, struct VkVertexInputAttributeDescription ** restrict out_attribute_descriptions_pointer);
 /* find memory type on GPU */
 static bool vsr_memory_type_find(struct VSR_Application * restrict application_pointer, uint32_t type_filter, const struct VSR_Memory_Levels_Requirements * restrict memory_requirements_pointer, uint32_t * restrict out_type_index_pointer);
 /* synchronization handle */
-static const char * vsr_synchronization_object_create(const struct VSR_Application * restrict application_pointer, struct VSR_Synchronization_Objects * restrict synchronization_object_pointer);
-static const char * vsr_synchronization_objects_create(struct VSR_Application * restrict application_pointer);
+static bool vsr_synchronization_fence_present_recreate(struct VSR_Application * restrict application_pointer);
+static void vsr_synchronization_fence_present_destroy(VkDevice device, VkFence * restrict fences_pointer, uint32_t fences_amount);
+static void vsr_synchronization_semaphores_render_finished_destroy(VkDevice device, VkSemaphore * restrict semaphores_pointer, uint32_t semaphores_amount);
+static const char * vsr_synchronization_create(struct VSR_Application * restrict application_pointer);
+static const char * vsr_synchronization_frame_create(const struct VSR_Application * restrict application_pointer, struct VSR_Synchronization_Frame * restrict synchronization_frame_pointer);
+static const char * vsr_synchronization_frames_create(struct VSR_Application * restrict application_pointer);
+static const char * vsr_synchronization_fence_present_create(struct VSR_Application * restrict application_pointer, VkFence ** restrict out_fences_pointer, uint32_t fences_to_create_amount);
+static const char * vsr_synchronization_semaphores_render_finished_create(struct VSR_Application * restrict application_pointer, VkSemaphore ** restrict out_semaphores_pointer, uint32_t semaphores_to_create_amount);
 /* delayed deletion */
 static void vsr_delay_deletion_process(struct VSR_Application * restrict application_pointer);
 static void vsr_delay_deletion_data_destroy(struct VSR_Application * restrict application_pointer);
 static const char * vsr_delay_deletion_cleanup(struct VSR_Application * restrict application_pointer);
 static const char * vsr_delay_deletion_initialize(struct VSR_Application * restrict application_pointer);
+static inline bool vsr_frame_reached(uint32_t frame_current, uint32_t frame_target);
 static inline struct VSR_Deletion_Entity vsr_get_delay_deletion_entity_data(struct VSR_Application * restrict application_pointer);
 
 /* draw frame */
@@ -456,14 +524,17 @@ static void vsr_frame_draw(struct VSR_Application * restrict application_pointer
 static void vsr_frame_discard(struct VSR_Application * restrict application_pointer, uint32_t image_index);
 static void vsr_frame_render_failed(struct VSR_Application * restrict application_pointer, const char * restrict error_message_pointer);
 static bool vsr_surface_recreate(struct VSR_Application * restrict application_pointer);
-static bool vsr_frame_image_present(struct VSR_Application * restrict application_pointer, const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer, uint32_t image_index);
-static bool vsr_frame_image_acquire(struct VSR_Application * restrict application_pointer, const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer, uint32_t * restrict out_image_index);
-static bool vsr_frame_commands_submit(struct VSR_Application * restrict application_pointer, const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer, uint32_t image_index);
-static bool vsr_frame_fence_present_reset(struct VSR_Application * restrict application_pointer, const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer);
-static VkResult vsr_frame_fences_wait(const struct VSR_Application * restrict application_pointer, const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer);
+static bool vsr_frame_image_present(struct VSR_Application * restrict application_pointer, uint32_t image_index);
+static bool vsr_frame_image_acquire(struct VSR_Application * restrict application_pointer, const struct VSR_Synchronization_Frame * restrict synchronization_frame_pointer, uint32_t * restrict out_image_index);
+static bool vsr_frame_commands_submit(struct VSR_Application * restrict application_pointer, const struct VSR_Synchronization_Frame * restrict synchronization_frame_pointer, uint32_t image_index);
+static bool vsr_frame_fence_present_reset(struct VSR_Application * restrict application_pointer);
+static bool vsr_frame_image_present_result_handle(struct VSR_Application * restrict application_pointer, VkResult result);
+static VkResult vsr_frame_fences_wait(const struct VSR_Application * restrict application_pointer, const struct VSR_Synchronization_Frame * restrict synchronization_frame_pointer);
+static VkSemaphore vsr_frame_get_render_finished_semaphore(const struct VSR_Application * restrict application_pointer, uint32_t frame_index, uint32_t image_index);
 
 /* app main cycle */
 static void vsr_main_loop(struct VSR_Application * restrict application_pointer);
+static void vsr_thread_render_stop(struct VSR_Application * restrict application_pointer);
 static void * vsr_thread_render_function(void * restrict argument_pointer);
 
 /* app clean up */
@@ -472,17 +543,21 @@ static void vsr_application_cleanup(void * restrict argument_pointer);
 static void vsr_frame_buffer_destroy(VkDevice device, VkFramebuffer frame_buffer, VkFramebuffer * restrict frame_buffers_pointer, uint32_t frame_buffer_amount);
 static void vsr_deletion_entity_destroy(struct VSR_Application * restrict application_pointer, struct VSR_Deletion_Entity * restrict entity_pointer);
 static void vsr_device_and_resources_destroy(struct VSR_Application * restrict application_pointer);
-static void vsr_synchronization_objects_destroy(struct VSR_Application * restrict application_pointer, uint8_t objects_amount);
+static void vsr_synchronization_frames_destroy(struct VSR_Application * restrict application_pointer, uint8_t objects_amount);
 static void vsr_swap_chain_data_associated_destroy(struct VSR_Application * restrict application_pointer);
 
 int main (void) {
 	struct VSR_Application application = { 0 };
-	bool is_initialized = vsr_application_initialize( &application );
+	bool is_everything_went_well = vsr_application_initialize( &application );
 
-	if( is_initialized == true )
+	if(	is_everything_went_well == true ) {
 		vsr_main_loop( &application );
+		is_everything_went_well = atomic_load_explicit(
+			&application.is_render_failed, memory_order_relaxed
+		) == false;
+	}
 
-	exit( is_initialized == true ? EXIT_SUCCESS : EXIT_FAILURE );
+	exit( is_everything_went_well == true ? EXIT_SUCCESS : EXIT_FAILURE );
 }
 
 static void * vsr_thread_render_function( void * restrict argument_pointer ) {
@@ -492,7 +567,7 @@ static void * vsr_thread_render_function( void * restrict argument_pointer ) {
 	pthread_mutex_lock( &application_pointer->render_mutex );
 
 	while ( application_pointer->is_running == true ) {
-		if( application_pointer->is_minimized == true ) {
+		if(	application_pointer->is_minimized == true ) {
 			pthread_cond_wait(
 				&application_pointer->render_condition, &application_pointer->render_mutex
 			);
@@ -504,18 +579,18 @@ static void * vsr_thread_render_function( void * restrict argument_pointer ) {
 			(glfwGetTime() - application_pointer->last_resize_time_seconds) >=
 				VSR_RESIZE_SETTLE_SECONDS )
 		{
-			if( vsr_swap_chain_is_extent_needs_update(application_pointer) == true )
+			if(	vsr_swap_chain_is_extent_needs_update(application_pointer) == true )
 				is_resize_calm_down = true;
 			else
 				application_pointer->frame_state.is_resize_pending = false;
 		}
 
-		if( application_pointer->frame_state.is_projection_dirty == true )
+		if(	application_pointer->frame_state.is_projection_dirty == true )
 			vsr_projection_refresh( application_pointer );
 
 		pthread_mutex_unlock(&application_pointer->render_mutex );
 
-		if( is_resize_calm_down == true )
+		if(	is_resize_calm_down == true )
 			vsr_swap_chain_recreate( application_pointer );
 		vsr_frame_draw( application_pointer );
 
@@ -530,12 +605,12 @@ static void * vsr_thread_render_function( void * restrict argument_pointer ) {
 static bool vsr_vulkan_initialize( struct VSR_Application * restrict application_pointer ) {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( vsr_instance_create( application_pointer ) == false ) return false;
+	if(	vsr_instance_create( application_pointer ) == false ) return false;
 
 #ifndef NDEBUG
 
-	if( global_is_validation_layer_supported == true ) {
-		if( vsr_debug_messenger_setup( application_pointer ) == false )
+	if(	global_is_validation_layer_supported == true ) {
+		if(	vsr_debug_messenger_setup( application_pointer ) == false )
 			VSR_DEBUG_LOG("(vsr_vulkan_initialize) failed to set up debug messenger");
 		else
 			application_pointer->is_debug_messenger_established = true;
@@ -543,11 +618,11 @@ static bool vsr_vulkan_initialize( struct VSR_Application * restrict application
 
 #endif
 
-	if( vsr_surface_create( application_pointer ) == false ) return false;
-	if( vsr_device_physical_select(	application_pointer ) == false )return false;
+	if(	vsr_surface_create(			application_pointer ) == false ) return false;
+	if(	vsr_device_physical_select(	application_pointer ) == false ) return false;
 
 	const char * error_message_pointer = NULL;
-	if( (error_message_pointer = vsr_device_logical_create(	application_pointer )) != NULL ||
+	if(	(error_message_pointer = vsr_device_logical_create(	application_pointer )) != NULL ||
 		(error_message_pointer = vsr_device_resources_create(application_pointer)) != NULL)
 	{
 		woem_push( "%s", error_message_pointer );
@@ -566,7 +641,7 @@ static const char * vsr_device_resources_create(
 	const char * error_message_pointer = NULL;
 	VkImage * swap_chain_images_pointer;
 
-	if( (error_message_pointer = vsr_delay_deletion_initialize(application_pointer)) != NULL ||
+	if(	(error_message_pointer = vsr_delay_deletion_initialize(application_pointer)) != NULL ||
 		(error_message_pointer = vsr_swap_chain_create(
 			application_pointer, &application_pointer->swap_chain_data, &swap_chain_images_pointer
 		)) != NULL )
@@ -578,24 +653,24 @@ static const char * vsr_device_resources_create(
 			application_pointer->swap_chain_data.image_format,
 			&application_pointer->swap_chain_image_views_pointer
 		)) != NULL ||
-		(error_message_pointer = vsr_render_pass_create(application_pointer)		) != NULL ||
-		(error_message_pointer = vsr_descriptor_set_layout_create(application_pointer))!= NULL||
-		(error_message_pointer = vsr_graphics_pipeline_create(application_pointer)	) != NULL ||
+		(error_message_pointer = vsr_render_pass_create(application_pointer))			!= NULL ||
+		(error_message_pointer = vsr_descriptor_set_layout_create(application_pointer))	!= NULL ||
+		(error_message_pointer = vsr_graphics_pipeline_create(application_pointer))		!= NULL ||
 		(error_message_pointer = vsr_frame_buffer_create(
 			application_pointer, application_pointer->swap_chain_image_views_pointer,
 			&application_pointer->swap_chain_data
 		)) != NULL ||
-		(error_message_pointer = vsr_command_pools_create(application_pointer))			!= NULL ||
-		(error_message_pointer = vsr_buffers_fast_create(application_pointer))			!= NULL ||
-		(error_message_pointer = vsr_buffer_uniforms_create(application_pointer))		!= NULL ||
-		(error_message_pointer = vsr_descriptor_pool_create(application_pointer))		!= NULL ||
-		(error_message_pointer = vsr_descriptor_sets_create(application_pointer))		!= NULL ||
-		(error_message_pointer = vsr_command_buffers_create(application_pointer))		!= NULL ||
-		(error_message_pointer = vsr_synchronization_objects_create(application_pointer))!=NULL )
+		(error_message_pointer = vsr_command_pools_create(application_pointer))		!= NULL ||
+		(error_message_pointer = vsr_buffers_fast_create(application_pointer))		!= NULL ||
+		(error_message_pointer = vsr_buffer_uniforms_create(application_pointer))	!= NULL ||
+		(error_message_pointer = vsr_descriptor_pool_create(application_pointer))	!= NULL ||
+		(error_message_pointer = vsr_descriptor_sets_create(application_pointer))	!= NULL ||
+		(error_message_pointer = vsr_command_buffers_create(application_pointer))	!= NULL ||
+		(error_message_pointer = vsr_synchronization_create(application_pointer))	!= NULL )
 		goto out;
 
 	atomic_store_explicit(
-		&application_pointer->is_swap_chain_valid, true, memory_order_relaxed
+		&application_pointer->is_swap_chain_valid, true, memory_order_release
 	);
 
 out:
@@ -603,11 +678,67 @@ out:
 	return error_message_pointer;
 }
 
+static const char * vsr_synchronization_create(
+		struct VSR_Application * restrict application_pointer
+	)
+{
+	assert_m( application_pointer != NULL, "No application found" );
+
+	const char * error_message_pointer;
+	if((error_message_pointer = vsr_synchronization_frames_create(application_pointer)) != NULL )
+		return error_message_pointer;
+
+	application_pointer->render_finished_semaphores_amount =
+		(application_pointer->capabilities_device.has_swapchain_maintenance_1 == true)
+		? application_pointer->frames_in_flight_limit
+		: application_pointer->swap_chain_data.image_views_amount;
+
+	if((error_message_pointer = vsr_synchronization_semaphores_render_finished_create(
+			application_pointer, &application_pointer->render_finished_semaphores_pointer,
+			application_pointer->render_finished_semaphores_amount
+		)) != NULL )
+	{
+		application_pointer->render_finished_semaphores_pointer = NULL;
+		return error_message_pointer;
+	}
+
+	if(	application_pointer->capabilities_device.has_swapchain_maintenance_1 == true )
+		return vsr_synchronization_fence_present_create(
+			application_pointer, &application_pointer->present_fences_pointer,
+			application_pointer->frames_in_flight_limit
+		);
+
+	return NULL;
+}
+
 static void vsr_main_loop( struct VSR_Application * restrict application_pointer ) {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	while ( glfwWindowShouldClose( application_pointer->window_pointer ) == false )
+	while ( glfwWindowShouldClose( application_pointer->window_pointer ) == false &&
+			atomic_load_explicit(
+				&application_pointer->is_render_failed, memory_order_relaxed
+			) == false )
 		glfwWaitEvents();
+
+	vsr_thread_render_stop( application_pointer );
+}
+
+static void vsr_thread_render_stop(struct VSR_Application * restrict application_pointer) {
+	assert_m( application_pointer != NULL, "No application found" );
+	assert_m(
+		application_pointer->is_render_thread_created == true,
+		"function shall be called after threads creation only"
+	);
+
+	pthread_mutex_lock(&application_pointer->render_mutex);
+
+	application_pointer->is_running = false;
+
+	pthread_cond_broadcast(&application_pointer->render_condition);
+	pthread_mutex_unlock(&application_pointer->render_mutex);
+
+	pthread_join( application_pointer->render_thread, NULL );
+	application_pointer->is_render_thread_created = false;
 }
 
 static bool vsr_application_initialize(
@@ -629,24 +760,35 @@ static bool vsr_application_initialize(
 		.is_running				= true
 	};
 
-	if( pthread_mutex_init( &application_pointer->render_mutex, NULL ) != 0 ) {
+	atomic_init( &application_pointer->is_swap_chain_valid,			false	);
+	atomic_init( &application_pointer->is_render_failed,			false	);
+	atomic_init( &application_pointer->swap_chain_extent_packed,	0		);
+
+	if(	pthread_mutex_init( &application_pointer->render_mutex, NULL ) != 0 ) {
 		woem_push(
 			"(vsr_application_initialize) render mutual exclusion initialization failed"
 		);
 		return false;
 	}
-	if( pthread_cond_init( &application_pointer->render_condition, NULL ) != 0 ) {
+	if(	pthread_cond_init( &application_pointer->render_condition, NULL ) != 0 ) {
 		woem_push( "(vsr_application_initialize) render condition initialization failed" );
 		pthread_mutex_destroy( &application_pointer->render_mutex );
 		return false;
 	}
 
 	application_pointer->is_thread_objects_created = true;
-	if( vsr_window_initialize( application_pointer ) == false ||
+	if(	vsr_window_initialize( application_pointer ) == false ||
 		vsr_vulkan_initialize( application_pointer ) == false )
 		return false;
 
-	if( pthread_create(
+	glm_lookat(
+		(vec3){ 2.f, 2.f, 2.f },
+		(vec3){ 0.f, 0.f, 0.f },
+		(vec3){ 0.f, 0.f, 1.f },
+		application_pointer->cached_view
+	);
+
+	if(	pthread_create(
 			&application_pointer->render_thread, NULL, vsr_thread_render_function,
 			application_pointer
 		) != 0 )
@@ -665,13 +807,14 @@ static bool vsr_device_recreate( struct VSR_Application * restrict application_p
 	vsr_device_and_resources_destroy( application_pointer );
 
 	const char * error_message_pointer = NULL;
-	if( (error_message_pointer = vsr_device_logical_create( application_pointer )) != NULL ||
+	if(	(error_message_pointer = vsr_device_logical_create( application_pointer )) != NULL ||
 		(error_message_pointer = vsr_device_resources_create(application_pointer)) != NULL )
 	{
 		VSR_DEBUG_LOGF( "%s", error_message_pointer );
 		return false;
 	}
 
+	application_pointer->frame_discarded_amount = 0;
 	return true;
 }
 
@@ -720,17 +863,17 @@ static void vsr_device_and_resources_destroy(
 {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( application_pointer->device == VK_NULL_HANDLE )
+	if(	application_pointer->device == VK_NULL_HANDLE )
 		return;
 
 	vsr_swap_chain_data_associated_destroy(application_pointer);
 
-	if( application_pointer->command_buffers_pointer != NULL ) {
+	if(	application_pointer->command_buffers_pointer != NULL ) {
 		free( application_pointer->command_buffers_pointer );
 		application_pointer->command_buffers_pointer = NULL;
 	}
 
-	if( application_pointer->buffers_uniform_pointer != NULL ) {
+	if(	application_pointer->buffers_uniform_pointer != NULL ) {
 		for ( uint8_t buffer_uniform_index = 0;
 				buffer_uniform_index < application_pointer->frames_in_flight_limit;
 				++buffer_uniform_index )
@@ -742,8 +885,8 @@ static void vsr_device_and_resources_destroy(
 		application_pointer->buffers_uniform_pointer = NULL;
 	}
 
-	if( application_pointer->buffers_uniform_memory != VK_NULL_HANDLE ) {
-		if( application_pointer->buffers_uniform_mapped_pointer != NULL ) {
+	if(	application_pointer->buffers_uniform_memory != VK_NULL_HANDLE ) {
+		if(	application_pointer->buffers_uniform_mapped_pointer != NULL ) {
 			vkUnmapMemory(
 				application_pointer->device, application_pointer->buffers_uniform_memory
 			);
@@ -755,81 +898,90 @@ static void vsr_device_and_resources_destroy(
 		application_pointer->buffers_uniform_memory = NULL;
 	}
 
-	if( application_pointer->descriptor_pool != VK_NULL_HANDLE ) {
+	if(	application_pointer->descriptor_pool != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorPool(
 			application_pointer->device, application_pointer->descriptor_pool, NULL
 		);
 		application_pointer->descriptor_pool = VK_NULL_HANDLE;
 	}
 
-	if( application_pointer->descriptor_sets_pointer != NULL ) {
+	if(	application_pointer->descriptor_sets_pointer != NULL ) {
 		free( application_pointer->descriptor_sets_pointer );
 		application_pointer->descriptor_sets_pointer = NULL;
 	}
 
-	if( application_pointer->descriptor_set_layout != VK_NULL_HANDLE ) {
+	if(	application_pointer->descriptor_set_layout != VK_NULL_HANDLE ) {
 		vkDestroyDescriptorSetLayout(
 			application_pointer->device, application_pointer->descriptor_set_layout, NULL
 		);
 		application_pointer->descriptor_set_layout = VK_NULL_HANDLE;
 	}
 
-	if( application_pointer->buffer_vertex != VK_NULL_HANDLE ) {
+	if(	application_pointer->buffer_vertex != VK_NULL_HANDLE ) {
 		vkDestroyBuffer(application_pointer->device, application_pointer->buffer_vertex, NULL);
 		application_pointer->buffer_vertex = VK_NULL_HANDLE;
 	}
-	if( application_pointer->buffer_memory_vertex != VK_NULL_HANDLE ) {
+	if(	application_pointer->buffer_memory_vertex != VK_NULL_HANDLE ) {
 		vkFreeMemory(
 			application_pointer->device, application_pointer->buffer_memory_vertex, NULL
 		);
 		application_pointer->buffer_memory_vertex = VK_NULL_HANDLE;
 	}
 
-	if( application_pointer->buffer_index != VK_NULL_HANDLE ) {
+	if(	application_pointer->buffer_index != VK_NULL_HANDLE ) {
 		vkDestroyBuffer( application_pointer->device, application_pointer->buffer_index, NULL );
 		application_pointer->buffer_index = VK_NULL_HANDLE;
 	}
-	if( application_pointer->buffer_memory_index != VK_NULL_HANDLE ) {
+	if(	application_pointer->buffer_memory_index != VK_NULL_HANDLE ) {
 		vkFreeMemory(
 			application_pointer->device, application_pointer->buffer_memory_index, NULL
 		);
 		application_pointer->buffer_memory_index = VK_NULL_HANDLE;
 	}
 
-	if( application_pointer->graphics_pipeline != VK_NULL_HANDLE ) {
+	if(	application_pointer->graphics_pipeline != VK_NULL_HANDLE ) {
 		vkDestroyPipeline(
 			application_pointer->device, application_pointer->graphics_pipeline, NULL
 		);
 		application_pointer->graphics_pipeline = VK_NULL_HANDLE;
 	}
-	if( application_pointer->pipeline_layout != VK_NULL_HANDLE ) {
+	if(	application_pointer->pipeline_layout != VK_NULL_HANDLE ) {
 		vkDestroyPipelineLayout(
 			application_pointer->device, application_pointer->pipeline_layout, NULL
 		);
 		application_pointer->pipeline_layout = VK_NULL_HANDLE;
 	}
-	if( application_pointer->render_pass != VK_NULL_HANDLE ) {
+	if(	application_pointer->render_pass != VK_NULL_HANDLE ) {
 		vkDestroyRenderPass(
 			application_pointer->device, application_pointer->render_pass, NULL
 		);
 		application_pointer->render_pass = VK_NULL_HANDLE;
 	}
 
-	if( application_pointer->synchronization_objects_pointer != NULL ) {
-		vsr_synchronization_objects_destroy(
+	if(	application_pointer->synchronization_frame_pointer != NULL )
+		vsr_synchronization_frames_destroy(
 			application_pointer, application_pointer->frames_in_flight_limit
 		);
-		free( application_pointer->synchronization_objects_pointer );
-		application_pointer->synchronization_objects_pointer = NULL;
-	}
 
-	if( application_pointer->command_pool_graphic != VK_NULL_HANDLE ) {
+	if(	application_pointer->render_finished_semaphores_pointer != NULL )
+		vsr_synchronization_semaphores_render_finished_destroy(
+			application_pointer->device, application_pointer->render_finished_semaphores_pointer,
+			application_pointer->render_finished_semaphores_amount
+		);
+
+	if(	application_pointer->present_fences_pointer != NULL )
+		vsr_synchronization_fence_present_destroy(
+			application_pointer->device, application_pointer->present_fences_pointer,
+			application_pointer->frames_in_flight_limit
+		);
+
+	if(	application_pointer->command_pool_graphic != VK_NULL_HANDLE ) {
 		vkDestroyCommandPool(
 			application_pointer->device, application_pointer->command_pool_graphic, NULL
 		);
 		application_pointer->command_pool_graphic = VK_NULL_HANDLE;
 	}
-	if( application_pointer->command_pool_transfer != VK_NULL_HANDLE ) {
+	if(	application_pointer->command_pool_transfer != VK_NULL_HANDLE ) {
 		vkDestroyCommandPool(
 			application_pointer->device, application_pointer->command_pool_transfer, NULL
 		);
@@ -837,13 +989,13 @@ static void vsr_device_and_resources_destroy(
 	}
 
 	vkDestroyDevice( application_pointer->device, NULL );
-	application_pointer->device = VK_NULL_HANDLE; 
+	application_pointer->device = VK_NULL_HANDLE;
 }
 
 static void vsr_swap_chain_cleanup( struct VSR_Application * restrict application_pointer ) {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( application_pointer->swap_chain_data.frame_buffer			!= VK_NULL_HANDLE ||
+	if(	application_pointer->swap_chain_data.frame_buffer			!= VK_NULL_HANDLE ||
 		application_pointer->swap_chain_data.frame_buffers_pointer	!= NULL )
 	{
 		vsr_frame_buffer_destroy(
@@ -856,18 +1008,15 @@ static void vsr_swap_chain_cleanup( struct VSR_Application * restrict applicatio
 		application_pointer->swap_chain_data.frame_buffers_pointer	= NULL;
 	}
 
-	if( application_pointer->swap_chain_image_views_pointer != NULL ) {
-		for (size_t image = 0;
-				image < application_pointer->swap_chain_data.image_views_amount; ++image)
-			vkDestroyImageView(
-				application_pointer->device,
-				application_pointer->swap_chain_image_views_pointer[image], NULL
-			);
-		free( application_pointer->swap_chain_image_views_pointer );
+	if(	application_pointer->swap_chain_image_views_pointer != NULL ) {
+		vsr_image_views_destroy(
+			application_pointer->device, application_pointer->swap_chain_image_views_pointer,
+			application_pointer->swap_chain_data.image_views_amount
+		);
 		application_pointer->swap_chain_image_views_pointer = NULL;
 	}
 
-	if( application_pointer->swap_chain_data.swap_chain != VK_NULL_HANDLE ) {
+	if(	application_pointer->swap_chain_data.swap_chain != VK_NULL_HANDLE ) {
 		vkDestroySwapchainKHR(
 			application_pointer->device, application_pointer->swap_chain_data.swap_chain, NULL
 		);
@@ -879,7 +1028,7 @@ static void vsr_application_cleanup( void * restrict argument_pointer ) {
 	struct VSR_Application * application_pointer = (struct VSR_Application *) argument_pointer;
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( application_pointer->is_render_thread_created == true ) {
+	if(	application_pointer->is_render_thread_created == true ) {
 		pthread_mutex_lock( &application_pointer->render_mutex );
 		application_pointer->is_running = false;
 		pthread_cond_broadcast( &application_pointer->render_condition );
@@ -891,11 +1040,11 @@ static void vsr_application_cleanup( void * restrict argument_pointer ) {
 
 	vsr_device_and_resources_destroy( application_pointer );
 
-	if( application_pointer->instance != VK_NULL_HANDLE ) {
+	if(	application_pointer->instance != VK_NULL_HANDLE ) {
 
 #ifndef NDEBUG
 
-		if( application_pointer->is_debug_messenger_established == true )
+		if(	application_pointer->is_debug_messenger_established == true )
 			vsr_debug_utils_messenger_extension_destroy(
 				application_pointer->instance, application_pointer->debug_messenger_function
 
@@ -903,7 +1052,7 @@ static void vsr_application_cleanup( void * restrict argument_pointer ) {
 
 #endif
 
-		if( application_pointer->surface != VK_NULL_HANDLE ) {
+		if(	application_pointer->surface != VK_NULL_HANDLE ) {
 			vkDestroySurfaceKHR(
 				application_pointer->instance, application_pointer->surface, NULL
 			);
@@ -912,14 +1061,14 @@ static void vsr_application_cleanup( void * restrict argument_pointer ) {
 		vkDestroyInstance( application_pointer->instance, NULL );
 		application_pointer->instance = NULL;
 	}
-	if( application_pointer->window_pointer != NULL ) {
+	if(	application_pointer->window_pointer != NULL ) {
 		glfwDestroyWindow( application_pointer->window_pointer );
 		application_pointer->window_pointer = NULL;
 	}
-	if( application_pointer->is_initialized_glfw == true )
+	if(	application_pointer->is_initialized_glfw == true )
 		glfwTerminate();
 
-	if( application_pointer->is_thread_objects_created == true ) {
+	if(	application_pointer->is_thread_objects_created == true ) {
 		application_pointer->is_thread_objects_created = false;
 		pthread_cond_destroy( &application_pointer->render_condition );
 		pthread_mutex_destroy(&application_pointer->render_mutex );
@@ -930,7 +1079,7 @@ static void vsr_application_cleanup( void * restrict argument_pointer ) {
 			(error_message_pointer = woem_pop(&message_have_to_be_freed)) != NULL; )
 	{
 		fprintf( stderr, "error: %s\n", error_message_pointer );
-		if( message_have_to_be_freed == true )
+		if(	message_have_to_be_freed == true )
 			free( error_message_pointer );
 	}
 }
@@ -942,13 +1091,18 @@ static inline struct VSR_Deletion_Entity vsr_get_delay_deletion_entity_data(
 	assert_m( application_pointer != NULL, "No application found" );
 
 	return (struct VSR_Deletion_Entity) {
-		.swap_chain						= application_pointer->swap_chain_data.swap_chain,
-		.swap_chain_frame_buffer		= application_pointer->swap_chain_data.frame_buffer,
-		.swap_chain_frame_buffer_pointer=
-			application_pointer->swap_chain_data.frame_buffers_pointer,
-		.image_views_amount				= application_pointer->swap_chain_data.image_views_amount,
-		.swap_chain_image_views_pointer	= application_pointer->swap_chain_image_views_pointer,
-		.delete_frame					=
+		.swap_chain							= application_pointer->swap_chain_data.swap_chain,
+		.swap_chain_frame_buffer			= application_pointer->swap_chain_data.frame_buffer,
+		.swap_chain_frame_buffer_pointer	= application_pointer->swap_chain_data.
+			frame_buffers_pointer,
+		.image_views_amount					= application_pointer->swap_chain_data.
+			image_views_amount,
+		.swap_chain_image_views_pointer		= application_pointer->swap_chain_image_views_pointer,
+		.render_finished_semaphores_pointer =
+			(application_pointer->capabilities_device.has_swapchain_maintenance_1 == false)
+				? application_pointer->render_finished_semaphores_pointer
+				: NULL,
+		.delete_frame						=
 			application_pointer->frame_counter + application_pointer->frames_in_flight_limit
 	};
 }
@@ -959,7 +1113,7 @@ static const char * vsr_delay_deletion_cleanup(
 {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( rb_ring_buffer_is_full( &application_pointer->deletion_queue ) == true ) {
+	if(	rb_ring_buffer_is_full( &application_pointer->deletion_queue ) == true ) {
 		vkDeviceWaitIdle( application_pointer->device );
 
 		while ( rb_ring_buffer_peek(&application_pointer->deletion_queue) != NULL ) {
@@ -974,7 +1128,7 @@ static const char * vsr_delay_deletion_cleanup(
 
 	struct VSR_Deletion_Entity deletion = vsr_get_delay_deletion_entity_data(application_pointer);
 
-	if( rb_ring_buffer_push( &application_pointer->deletion_queue, &deletion ) == false )
+	if(	rb_ring_buffer_push( &application_pointer->deletion_queue, &deletion ) == false )
 		return "(vsr_delay_deletion_cleanup) failed to push to deletion queue";
 
 	return NULL;
@@ -992,19 +1146,32 @@ static void vsr_deletion_entity_destroy(
 		application_pointer->device, entity_pointer->swap_chain_frame_buffer,
 		entity_pointer->swap_chain_frame_buffer_pointer, entity_pointer->image_views_amount
 	);
+
+	vsr_image_views_destroy(
+		application_pointer->device, entity_pointer->swap_chain_image_views_pointer,
+		entity_pointer->image_views_amount
+	);
+
 	vkDestroySwapchainKHR(application_pointer->device, entity_pointer->swap_chain, NULL);
 
-	if( entity_pointer->swap_chain_image_views_pointer != NULL ) {
-		for ( uint32_t image_view_index = 0;
-				image_view_index < entity_pointer->image_views_amount; ++image_view_index )
-		{
-			vkDestroyImageView(
-				application_pointer->device,
-				entity_pointer->swap_chain_image_views_pointer[image_view_index], NULL
-			);
-		}
-		free( entity_pointer->swap_chain_image_views_pointer );
-	}
+
+	if(	entity_pointer->render_finished_semaphores_pointer != NULL )
+		vsr_synchronization_semaphores_render_finished_destroy(
+			application_pointer->device,
+			entity_pointer->render_finished_semaphores_pointer, entity_pointer->image_views_amount
+		);
+}
+
+static void vsr_image_views_destroy(
+		VkDevice device, VkImageView * restrict image_views_pointer, uint32_t image_views_amount
+	)
+{
+	assert_m( image_views_pointer != NULL, "No image views found" );
+
+	for(uint32_t image_view_index = 0; image_view_index < image_views_amount; ++image_view_index)
+		vkDestroyImageView( device, image_views_pointer[image_view_index], NULL );
+
+	free( image_views_pointer );
 }
 
 static void vsr_delay_deletion_process( struct VSR_Application * restrict application_pointer )
@@ -1017,19 +1184,25 @@ static void vsr_delay_deletion_process( struct VSR_Application * restrict applic
 		struct VSR_Deletion_Entity * entity_pointer = rb_ring_buffer_peek(
 			&application_pointer->deletion_queue
 		);
-		if( entity_pointer == NULL )
+		if(	entity_pointer == NULL )
 			break;
 
-		if( application_pointer->frame_counter < entity_pointer->delete_frame )
+		if(	vsr_frame_reached(
+				application_pointer->frame_counter, entity_pointer->delete_frame
+			) == false )
 			break;
 
 		vsr_deletion_entity_destroy( application_pointer, entity_pointer );
 		rb_ring_buffer_discard( &application_pointer->deletion_queue );
 	}
 
-	if( application_pointer->deletion_queue.amount == 0 )
+	if(	application_pointer->deletion_queue.amount == 0 )
 		application_pointer->frame_counter = 0;
 	else ++application_pointer->frame_counter;
+}
+
+static inline bool vsr_frame_reached(uint32_t frame_current, uint32_t frame_target) {
+	return ((uint32_t)frame_current - (uint32_t)frame_target) < (UINT32_MAX / 2);
 }
 
 static const char * vsr_descriptor_sets_create(
@@ -1054,7 +1227,7 @@ static const char * vsr_descriptor_sets_create(
 		.pSetLayouts		= layouts_array
 	};
 
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			&application_pointer->descriptor_sets_pointer,
 			application_pointer->frames_in_flight_limit, sizeof(VkDescriptorSet)
 		) == false )
@@ -1108,7 +1281,7 @@ static const char * vsr_descriptor_pool_create(
 		.pPoolSizes		= &pool_size
 	};
 
-	return( vkCreateDescriptorPool(
+	return( vkCreateDescriptorPool_wrapped(
 				application_pointer->device, &pool_information, NULL,
 				&application_pointer->descriptor_pool
 			) == VK_SUCCESS )
@@ -1134,7 +1307,7 @@ static const char * vsr_descriptor_set_layout_create(
 		.pBindings		= &buffer_uniform_object_layout_binding
 	};
 
-	return( vkCreateDescriptorSetLayout(
+	return( vkCreateDescriptorSetLayout_wrapped(
 				application_pointer->device, &layout_create_information, NULL,
 				&application_pointer->descriptor_set_layout
 			) == VK_SUCCESS )
@@ -1143,24 +1316,22 @@ static const char * vsr_descriptor_set_layout_create(
 }
 
 static const char * vsr_buffer_uniform_create(
-		struct VSR_Application * restrict application_pointer
+		struct VSR_Application * restrict application_pointer,
+		const VkPhysicalDeviceProperties * restrict device_properties_pointer
 	)
 {
-	VkPhysicalDeviceProperties device_properties;
-	vkGetPhysicalDeviceProperties( application_pointer->device_physical, &device_properties );
-
 	VkDeviceSize buffer_size;
 	VkDeviceSize safe_alignment_required =
-		(device_properties.limits.minUniformBufferOffsetAlignment == 0)
+		(device_properties_pointer->limits.minUniformBufferOffsetAlignment == 0)
 		? 1
-		: device_properties.limits.minUniformBufferOffsetAlignment;
-	if( sa_ovf_round_up_uint64_t(
+		: device_properties_pointer->limits.minUniformBufferOffsetAlignment;
+	if(	sa_ovf_round_up_uint64_t(
 			application_pointer->buffer_uniform_size, safe_alignment_required, &buffer_size
 		) == true)
 		return "(vsr_buffer_uniform_create) uniform buffer alignment calculus failed";
 
 	VkBuffer * uniform_buffers_pointer;
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			&uniform_buffers_pointer,
 			application_pointer->frames_in_flight_limit,
 			sizeof(*uniform_buffers_pointer)
@@ -1180,7 +1351,7 @@ static const char * vsr_buffer_uniform_create(
 			buffer_uniform_index < application_pointer->frames_in_flight_limit;
 			++buffer_uniform_index )
 	{
-		if(vkCreateBuffer(
+		if(	vkCreateBuffer(
 				application_pointer->device, &buffer_create_information, NULL,
 				&uniform_buffers_pointer[buffer_uniform_index]
 			) != VK_SUCCESS )
@@ -1208,8 +1379,13 @@ static const char * vsr_buffer_uniforms_create(
 
 	application_pointer->buffer_uniform_size = sizeof( struct VSR_Uniform_Buffer_Object );
 
+	VkPhysicalDeviceProperties device_properties;
+	vkGetPhysicalDeviceProperties(application_pointer->device_physical, &device_properties);
+
 	const char * error_message_pointer;
-	if((error_message_pointer = vsr_buffer_uniform_create(application_pointer)) != NULL)
+	if((error_message_pointer = vsr_buffer_uniform_create(
+			application_pointer, &device_properties
+		)) != NULL )
 		return error_message_pointer;
 
 	VkMemoryRequirements memory_requirements;
@@ -1221,11 +1397,14 @@ static const char * vsr_buffer_uniforms_create(
 	const struct VSR_Memory_Properties memory_properties[] = {
 		{
 			.list_required	=
-				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-			.list_forbidden	= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+				VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			.list_forbidden	= 0
 		}, {
-			.list_required	= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-			.list_forbidden	= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+			.list_required	=
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+				VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			.list_forbidden	= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
 		}, {
 			.list_required	= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
 			.list_forbidden	= 0
@@ -1238,7 +1417,7 @@ static const char * vsr_buffer_uniforms_create(
 	};
 
 	uint32_t memory_type_index;
-	if( vsr_memory_type_find(
+	if(	vsr_memory_type_find(
 			application_pointer, memory_requirements.memoryTypeBits, &memory_requirements_list,
 			&memory_type_index
 		) == false )
@@ -1247,21 +1426,34 @@ static const char * vsr_buffer_uniforms_create(
 	application_pointer->is_buffer_uniform_coherent =
 		vsr_memory_type_is_coherent(application_pointer, memory_type_index);
 
-	VkDeviceSize safe_alignment_required = (memory_requirements.alignment == 0)
+	VkDeviceSize atom_size = 1;
+	if(	application_pointer->is_buffer_uniform_coherent	== false &&
+		device_properties.limits.nonCoherentAtomSize	!= 0 )
+		atom_size = device_properties.limits.nonCoherentAtomSize;
+
+	VkDeviceSize alignment_base = (memory_requirements.alignment == 0)
 		? 1
 		: memory_requirements.alignment;
-	if( sa_ovf_round_up_uint64_t(
-			memory_requirements.size, safe_alignment_required,
-			&application_pointer->buffer_uniform_alignment_size
+	if(	sa_ovf_round_up_uint64_t( alignment_base, atom_size, &alignment_base ) == true )
+		return "(vsr_buffer_uniforms_create) alignment overflow";
+	if(	sa_ovf_round_up_uint64_t(
+			memory_requirements.size, alignment_base,
+			&application_pointer->buffer_uniform_size_alignment
 		) == true )
 		return "(vsr_buffer_uniforms_create) allocation size alignment overflow";
 
 	VkDeviceSize allocation_size;
-	if( sa_ovf_mul_uint64_t(
-			application_pointer->buffer_uniform_alignment_size,
+	if(	sa_ovf_mul_uint64_t(
+			application_pointer->buffer_uniform_size_alignment,
 			application_pointer->frames_in_flight_limit, &allocation_size
 		) == true )
 		return "(vsr_buffer_uniforms_create) invalid allocation size";
+
+	if(	sa_ovf_round_up_uint64_t(
+			application_pointer->buffer_uniform_size, atom_size,
+			&application_pointer->buffer_uniform_size_flush
+		) == true )
+		return "(vsr_buffer_uniforms_create) flush size alignment overflow";
 
 	struct VkMemoryAllocateInfo allocate_information = {
 		.sType				= VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -1269,13 +1461,13 @@ static const char * vsr_buffer_uniforms_create(
 		.memoryTypeIndex	= memory_type_index
 	};
 
-	if( vkAllocateMemory(
+	if(	vkAllocateMemory_wrapped(
 			application_pointer->device, &allocate_information, NULL,
 			&application_pointer->buffers_uniform_memory
 		) != VK_SUCCESS )
 		return "(vsr_buffer_uniforms_create) uniform buffer memory allocation failed";
 
-	if( vkMapMemory(
+	if(	vkMapMemory(
 			application_pointer->device, application_pointer->buffers_uniform_memory, 0,
 			VK_WHOLE_SIZE, 0, &application_pointer->buffers_uniform_mapped_pointer
 		) != VK_SUCCESS )
@@ -1286,12 +1478,12 @@ static const char * vsr_buffer_uniforms_create(
 			++buffer_uniform_index )
 	{
 		VkDeviceSize size_offset;
-		if( sa_ovf_mul_uint64_t(
-				buffer_uniform_index, application_pointer->buffer_uniform_alignment_size,
+		if(	sa_ovf_mul_uint64_t(
+				buffer_uniform_index, application_pointer->buffer_uniform_size_alignment,
 				&size_offset
 			) == true )
 			return "(vsr_buffer_uniforms_create) invalid offset size";
-		if( vkBindBufferMemory(
+		if(	vkBindBufferMemory(
 				application_pointer->device,
 				application_pointer->buffers_uniform_pointer[buffer_uniform_index],
 				application_pointer->buffers_uniform_memory, size_offset
@@ -1428,21 +1620,21 @@ static const char * vsr_buffer_inclusive_create(
 	assert_m( out_allocation_data_pointer	!= NULL, "No allocation data storage found"	);
 
 	void * data_pointer;
-	if( vkMapMemory(
+	if(	vkMapMemory(
 			application_pointer->device, allocation_data_staging.memory, 0, VK_WHOLE_SIZE, 0,
 			&data_pointer
 		) != VK_SUCCESS )
 		return "(vsr_buffer_inclusive_create) staging buffer memory mapping failed";
 
 	memcpy( data_pointer, buffer_pointer, (size_t) buffer_size );
-	
-	if( allocation_data_staging.is_coherent == false ) {
+
+	if(	allocation_data_staging.is_coherent == false ) {
 		const struct VkMappedMemoryRange flush_range = {
 			.sType	= VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
 			.memory	= allocation_data_staging.memory,
 			.size	= VK_WHOLE_SIZE
 		};
-		if( vkFlushMappedMemoryRanges(
+		if(	vkFlushMappedMemoryRanges(
 				application_pointer->device, 1, &flush_range
 			) != VK_SUCCESS)
 		{
@@ -1518,17 +1710,21 @@ static const char * vsr_buffer_copy(
 		.flags				= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
 	};
 
-	if( vkBeginCommandBuffer( command_buffer, &command_buffer_begin_information ) != VK_SUCCESS )
-	{
+	if(	vkBeginCommandBuffer(command_buffer, &command_buffer_begin_information) != VK_SUCCESS ) {
 		error_message_pointer = "(vsr_buffer_copy) recording command buffer beginning failed";
 		goto out;
 	}
 
 	struct VkBufferCopy region_to_copy = (struct VkBufferCopy) { .size = size };
-
 	vkCmdCopyBuffer( command_buffer, buffer_source, buffer_destination, 1, &region_to_copy );
 
-	if( vkEndCommandBuffer( command_buffer ) != VK_SUCCESS ) {
+	vsr_buffer_copy_barrier(
+		command_buffer, buffer_destination, size,
+		application_pointer->queue_family_indices.graphics_family,
+		application_pointer->queue_family_indices.transfer_family
+	);
+
+	if(	vkEndCommandBuffer( command_buffer ) != VK_SUCCESS ) {
 		error_message_pointer = "(vsr_buffer_copy) command buffer recording failed";
 		goto out;
 	}
@@ -1539,21 +1735,150 @@ static const char * vsr_buffer_copy(
 		.pCommandBuffers	= &command_buffer
 	};
 
-	if( vkQueueSubmit(
+	if(	vkQueueSubmit(
 			application_pointer->transfer_queue, 1, &submit_information, VK_NULL_HANDLE
 		) != VK_SUCCESS )
 	{
 		error_message_pointer = "(vsr_buffer_copy) copy command buffer submission failed";
 		goto out;
 	}
-	if( vkQueueWaitIdle( application_pointer->transfer_queue ) != VK_SUCCESS ) {
+	if(	vkQueueWaitIdle( application_pointer->transfer_queue ) != VK_SUCCESS ) {
 		error_message_pointer = "(vsr_buffer_copy) transfer queue wait failed";
 		goto out;
 	}
 
+	vsr_buffer_ownership_acquire(application_pointer, buffer_destination, size);
+
 out:
 	vkFreeCommandBuffers( application_pointer->device, command_pool, 1, &command_buffer );
 	return error_message_pointer;
+}
+
+static const char * vsr_buffer_ownership_acquire(
+		struct VSR_Application * restrict application_pointer,
+		VkBuffer buffer_destination, VkDeviceSize size
+	)
+{
+	assert_m( application_pointer != NULL, "No application found" );
+
+	if(	application_pointer->queue_family_indices.transfer_family ==
+		application_pointer->queue_family_indices.graphics_family )
+		return NULL;
+
+	struct VkCommandBufferAllocateInfo allocation_information = {
+		.sType				= VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.commandPool		= application_pointer->command_pool_graphic,
+		.level				= VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount	= 1
+	};
+	VkCommandBuffer command_buffer;
+	if(	vkAllocateCommandBuffers(
+			application_pointer->device, &allocation_information, &command_buffer
+		) != VK_SUCCESS )
+		return "(vsr_buffer_ownership_acquire) command buffer allocation failed";
+
+	const char * error_message_pointer = vsr_buffer_ownership_acquire_record(
+		application_pointer, command_buffer, buffer_destination, size
+	);
+	if(	error_message_pointer != NULL ) {
+		vkFreeCommandBuffers(
+			application_pointer->device, application_pointer->command_pool_graphic, 1,
+			&command_buffer
+		);
+		return error_message_pointer;
+	}
+
+	return vsr_buffer_ownership_acquire_submit_wait(application_pointer, command_buffer);
+}
+
+static const char * vsr_buffer_ownership_acquire_record(
+		struct VSR_Application * restrict application_pointer,
+		VkCommandBuffer command_buffer, VkBuffer buffer_destination, VkDeviceSize size
+	)
+{
+	assert_m( application_pointer != NULL, "No application found" );
+
+	struct VkCommandBufferBeginInfo command_buffer_begin_information = {
+		.sType				= VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		/* type of command buffer using */
+		.flags				= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+	};
+
+	if(	vkBeginCommandBuffer(command_buffer, &command_buffer_begin_information) != VK_SUCCESS )
+		return "(vsr_buffer_ownership_acquire_record) recording command buffer beginning failed";
+
+	struct VkBufferMemoryBarrier memory_barrier_acquire = {
+		.sType				= VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.dstAccessMask		= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT,
+		.srcQueueFamilyIndex= application_pointer->queue_family_indices.transfer_family,
+		.dstQueueFamilyIndex= application_pointer->queue_family_indices.graphics_family,
+		.buffer				= buffer_destination,
+		.size				= size
+	};
+	vkCmdPipelineBarrier(
+		command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+		0, 0, NULL, 1, &memory_barrier_acquire, 0, NULL
+	);
+
+	return (vkEndCommandBuffer( command_buffer ) != VK_SUCCESS)
+		? "(vsr_buffer_ownership_acquire_record) command buffer recording failed"
+		: NULL;
+}
+
+static const char * vsr_buffer_ownership_acquire_submit_wait(
+		struct VSR_Application * restrict application_pointer, VkCommandBuffer command_buffer
+	)
+{
+	assert_m( application_pointer != NULL, "No application found" );
+
+	struct VkSubmitInfo submit_information = {
+		.sType				= VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.commandBufferCount	= 1,
+		.pCommandBuffers	= &command_buffer
+	};
+
+	VkResult result = vkQueueSubmit(
+		application_pointer->graphics_queue, 1, &submit_information, VK_NULL_HANDLE
+	);
+
+	const char * error_message_pointer = NULL;
+	if(	result == VK_SUCCESS )
+		result = vkQueueWaitIdle(application_pointer->graphics_queue);
+	else
+		error_message_pointer =
+			"(vsr_buffer_ownership_acquire_submit_wait) acquiring submission failed";
+
+	vkFreeCommandBuffers(
+		application_pointer->device, application_pointer->command_pool_graphic, 1, &command_buffer
+	);
+
+	return (error_message_pointer != NULL)
+		? error_message_pointer
+		: ( result != VK_SUCCESS )
+			? "(vsr_buffer_ownership_acquire_submit_wait) graphics queue wait failed"
+			: NULL;
+}
+
+static void vsr_buffer_copy_barrier(
+		VkCommandBuffer command_buffer, VkBuffer buffer_destination, VkDeviceSize size,
+		uint32_t graphics_family, uint32_t transfer_family
+	)
+{
+	if(	graphics_family == transfer_family )
+		return;
+
+	struct VkBufferMemoryBarrier memory_barrier_release = {
+		.sType				= VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+		.srcAccessMask		= VK_ACCESS_TRANSFER_WRITE_BIT,
+		.srcQueueFamilyIndex= transfer_family,
+		.dstQueueFamilyIndex= graphics_family,
+		.buffer				= buffer_destination,
+		.size				= size
+	};
+	vkCmdPipelineBarrier(
+		command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		0, 0, NULL, 1, &memory_barrier_release, 0, NULL
+	);
 }
 
 static const char * vsr_buffer_create(
@@ -1574,7 +1899,7 @@ static const char * vsr_buffer_create(
 		.sharingMode	= VK_SHARING_MODE_EXCLUSIVE
 	};
 
-	if( vkCreateBuffer(
+	if(	vkCreateBuffer(
 			application_pointer->device, &buffer_create_information, NULL,
 			&out_allocation_data_pointer->buffer
 		) != VK_SUCCESS )
@@ -1587,7 +1912,7 @@ static const char * vsr_buffer_create(
 
 	const char * error_message_pointer;
 	uint32_t memory_type_index = 0;
-	if( vsr_memory_type_find(
+	if(	vsr_memory_type_find(
 			application_pointer, memory_requirements.memoryTypeBits, requirements_list,
 			&memory_type_index
 		) == false )
@@ -1614,7 +1939,7 @@ static const char * vsr_buffer_create(
 		goto cleanup;
 	}
 
-	if( vkBindBufferMemory(
+	if(	vkBindBufferMemory(
 			application_pointer->device, out_allocation_data_pointer->buffer,
 			out_allocation_data_pointer->memory, 0
 		) != VK_SUCCESS )
@@ -1651,7 +1976,7 @@ static bool vsr_memory_type_find(
 	uint32_t candidate_best = UINT32_MAX;
 	int64_t candidate_priority_best	= -1;
 
-	if( memory_properties_pointer->memoryTypeCount > VK_MAX_MEMORY_TYPES ) {
+	if(	memory_properties_pointer->memoryTypeCount > VK_MAX_MEMORY_TYPES ) {
 		VSR_DEBUG_LOGF(
 			"(vsr_memory_type_find) memory type count %u exceeds safe limit",
 			memory_properties_pointer->memoryTypeCount
@@ -1662,7 +1987,7 @@ static bool vsr_memory_type_find(
 	for(uint32_t candidate = 0;
 			candidate < memory_properties_pointer->memoryTypeCount; ++candidate )
 	{
-		if( (type_filter & ( (uint32_t) 1 << candidate)) == 0 )
+		if(	(type_filter & ( (uint32_t) 1 << candidate)) == 0 )
 			continue;
 
 		VkMemoryPropertyFlags candidate_flags_current =
@@ -1688,14 +2013,14 @@ static bool vsr_memory_type_find(
 			}
 		}
 
-		if( candidate_priority_current == UINT32_MAX )
+		if(	candidate_priority_current == UINT32_MAX )
 			continue;
 
 		uint32_t heap_index = memory_properties_pointer->memoryTypes[candidate].heapIndex;
 		VkDeviceSize candidate_size_current =
 			memory_properties_pointer->memoryHeaps[heap_index].size;
 
-		if( candidate_priority_best == -1 ||
+		if(	candidate_priority_best == -1 ||
 			candidate_priority_current < candidate_priority_best ||
 			(candidate_priority_current == candidate_priority_best &&
 			candidate_size_current > candidate_size_best) )
@@ -1706,7 +2031,7 @@ static bool vsr_memory_type_find(
 		}
 	}
 
-	if( candidate_priority_best == -1 )
+	if(	candidate_priority_best == -1 )
 		return false;
 
 	*out_type_index_pointer = (uint32_t) candidate_best;
@@ -1721,58 +2046,24 @@ static struct VkVertexInputBindingDescription vsr_get_binding_description(void) 
 	return binding_description;
 }
 
-static const char * vsr_get_attribute_descriptions(
-		uint32_t * restrict out_size_pointer,
-		struct VkVertexInputAttributeDescription ** restrict out_attribute_descriptions_pointer
-	)
-{
-	assert_m( out_size_pointer					!= NULL,"No size storage found"					);
-	assert_m( out_attribute_descriptions_pointer!= NULL,"No attribute description storage found");
-
-	struct VkVertexInputAttributeDescription attribute_descriptions[2] = {
-		{
-			0 ,0, VK_FORMAT_R32G32_SFLOAT, offsetof(struct VSR_Vertex, position)
-		}, {
-			1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(struct VSR_Vertex, color)
-		}
-	};
-	size_t attribute_descriptions_amount =
-		sizeof(attribute_descriptions) / sizeof(*attribute_descriptions);
-
-	if( sa_malloc_array(
-			out_attribute_descriptions_pointer, attribute_descriptions_amount,
-			sizeof(**out_attribute_descriptions_pointer)
-		) == false )
-		return "(vsr_get_attribute_descriptions) allocation size overflow";
-	else if ( *out_attribute_descriptions_pointer == NULL )
-		return
-			"(vsr_get_attribute_descriptions) "
-			"vertex attribute description memory allocation failed";
-
-	memcpy(
-		*out_attribute_descriptions_pointer,
-		attribute_descriptions,
-		sizeof(attribute_descriptions)
-	);
-	if( out_size_pointer != NULL )
-		*out_size_pointer = (uint32_t) attribute_descriptions_amount;
-
-	return NULL;
-}
-
 static bool vsr_swap_chain_is_extent_needs_update(
 		struct VSR_Application * restrict application_pointer
 	)
 {
 	VkSurfaceCapabilitiesKHR capabilities;
-	if( vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+	if(	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 			application_pointer->device_physical, application_pointer->surface, &capabilities
 		) != VK_SUCCESS )
 		return true;
 
+	/* under external mutex */
 	struct VkExtent2D current_extent = (capabilities.currentExtent.width != UINT32_MAX)
 		? capabilities.currentExtent
-		: vsr_swap_extent_choose( &capabilities, application_pointer->window_pointer );
+		: vsr_swap_extent_choose(
+			&capabilities,
+			(uint32_t) application_pointer->frame_state.width,
+			(uint32_t) application_pointer->frame_state.height
+		);
 
 	return
 		current_extent.width	!= application_pointer->swap_chain_data.extent.width ||
@@ -1788,17 +2079,23 @@ static bool vsr_swap_chain_recreate( struct VSR_Application * restrict applicati
 
 	pthread_mutex_unlock( &application_pointer->render_mutex );
 
-	if( is_minimized == true )
+	if(	is_minimized == true )
 		return false;
 
-	if( application_pointer->swap_chain_recreate_failed_amount >=
-			VSR_LIMIT_SWAPCHAIN_RECREATE_FAILURES )
+	if(	application_pointer->swap_chain_recreate_failed_amount >=
+			VSR_LIMIT_FAILURES_SWAPCHAIN_RECREATE )
 	{
 		vsr_frame_render_failed(
 			application_pointer, "(vsr_swap_chain_recreate) swap chain recreation failed"
 		);
 		return false;
 	}
+
+	return vsr_swap_chain_recreate_data( application_pointer );
+}
+
+static bool vsr_swap_chain_recreate_data(struct VSR_Application * restrict application_pointer) {
+	assert_m( application_pointer != NULL, "No application found" );
 
 	struct VSR_Swap_Chain_Data	new_swap_chain_data;
 	VkImage						* swap_chain_images_pointer;
@@ -1821,22 +2118,15 @@ static bool vsr_swap_chain_recreate( struct VSR_Application * restrict applicati
 		)) != NULL )
 		goto cleanup_image_views;
 
-	if( (error_message_pointer = vsr_delay_deletion_cleanup(application_pointer)) != NULL )
+	if((error_message_pointer = vsr_swap_chain_deletion_resources_handle(
+			application_pointer, new_swap_chain_data.image_views_amount
+		)) != NULL )
 		goto cleanup_frame_buffer;
 
 	free( swap_chain_images_pointer );
 
-	application_pointer->swap_chain_data					= new_swap_chain_data;
-	application_pointer->swap_chain_image_views_pointer		= swap_chain_image_views_pointer_new;
-	application_pointer->swap_chain_recreate_failed_amount	= 0;
-
-	atomic_store_explicit(
-		&application_pointer->swap_chain_extent_packed,
-		((uint64_t) new_swap_chain_data.extent.width << 32) | (uint64_t) new_swap_chain_data.extent.height,
-		memory_order_relaxed
-	);
-	atomic_store_explicit(
-		&application_pointer->is_swap_chain_valid, true, memory_order_relaxed
+	vsr_swap_chain_recreate_data_commit(
+		application_pointer, &new_swap_chain_data, swap_chain_image_views_pointer_new
 	);
 
 	return true;
@@ -1848,12 +2138,10 @@ cleanup_frame_buffer:
 	);
 
 cleanup_image_views:
-	for ( uint32_t image = 0; image < new_swap_chain_data.image_views_amount; ++image )
-		vkDestroyImageView(
-			application_pointer->device, swap_chain_image_views_pointer_new[image], NULL
-		);
-	free( swap_chain_image_views_pointer_new );
-	swap_chain_image_views_pointer_new = NULL;
+	vsr_image_views_destroy(
+		application_pointer->device, swap_chain_image_views_pointer_new,
+		new_swap_chain_data.image_views_amount
+	);
 
 cleanup_swap_chain:
 	vkDestroySwapchainKHR( application_pointer->device, new_swap_chain_data.swap_chain, NULL );
@@ -1862,13 +2150,84 @@ cleanup_swap_chain:
 cleanup:
 	++application_pointer->swap_chain_recreate_failed_amount;
 	VSR_DEBUG_LOGF( "Error: %s", error_message_pointer );
+
 	return false;
+}
+
+static void vsr_swap_chain_recreate_data_commit(
+		struct VSR_Application * restrict application_pointer,
+		const struct VSR_Swap_Chain_Data * restrict swap_chain_data_pointer,
+		VkImageView * restrict swap_chain_image_views_pointer
+	)
+{
+	assert_m( application_pointer			!= NULL, "No application found"				);
+	assert_m( swap_chain_data_pointer		!= NULL, "No swap chain data found"			);
+	assert_m( swap_chain_image_views_pointer!= NULL, "No swap chain image views found"	);
+
+	application_pointer->swap_chain_data					= *swap_chain_data_pointer;
+	application_pointer->swap_chain_image_views_pointer		= swap_chain_image_views_pointer;
+	application_pointer->swap_chain_recreate_failed_amount	= 0;
+
+	atomic_store_explicit(
+		&application_pointer->swap_chain_extent_packed,
+		((uint64_t) swap_chain_data_pointer->extent.width << 32) |
+			(uint64_t) swap_chain_data_pointer->extent.height,
+		memory_order_relaxed
+	);
+
+	atomic_store_explicit(
+		&application_pointer->is_swap_chain_valid, true, memory_order_release
+	);
+}
+
+static const char * vsr_swap_chain_deletion_resources_handle(
+		struct VSR_Application * restrict application_pointer, const uint32_t image_views_amount
+	)
+{
+	assert_m( application_pointer != NULL, "No application found" );
+
+	if(	application_pointer->capabilities_device.has_swapchain_maintenance_1 == true )
+		return vsr_delay_deletion_cleanup(application_pointer);
+
+	return vsr_swap_chain_render_finished_semaphores_recreate(
+		application_pointer, image_views_amount
+	);
+}
+
+static const char * vsr_swap_chain_render_finished_semaphores_recreate(
+		struct VSR_Application * restrict application_pointer, const uint32_t image_views_amount
+	)
+{
+	assert_m( application_pointer != NULL, "No application found" );
+
+	const char * error_message_pointer;
+	VkSemaphore * render_finished_semaphores_pointer;
+	if((error_message_pointer = vsr_synchronization_semaphores_render_finished_create(
+			application_pointer, &render_finished_semaphores_pointer, image_views_amount
+		)) != NULL )
+		return error_message_pointer;
+
+	if(	vkQueueWaitIdle( application_pointer->present_queue ) != VK_SUCCESS ) {
+		vsr_synchronization_semaphores_render_finished_destroy(
+			application_pointer->device, render_finished_semaphores_pointer, image_views_amount
+		);
+		return "(vsr_swap_chain_render_finished_semaphores_recreate) present queue wait failed";
+	}
+
+	struct VSR_Deletion_Entity deletion_data =
+		vsr_get_delay_deletion_entity_data(application_pointer);
+	vsr_deletion_entity_destroy( application_pointer, &deletion_data );
+
+	application_pointer->render_finished_semaphores_pointer	= render_finished_semaphores_pointer;
+	application_pointer->render_finished_semaphores_amount	= image_views_amount;
+
+	return NULL;
 }
 
 static bool vsr_surface_create( struct VSR_Application * restrict application_pointer ) {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( glfwCreateWindowSurface(
+	if(	glfwCreateWindowSurface(
 			application_pointer->instance, application_pointer->window_pointer, NULL,
 			&application_pointer->surface
 		) != VK_SUCCESS )
@@ -1894,22 +2253,20 @@ static const char * vsr_device_logical_create(
 
 	unique_families_array[families_amount++] =
 		application_pointer->queue_family_indices.graphics_family;
-	if( present_family != graphics_family )
+	if(	present_family != graphics_family )
 		unique_families_array[families_amount++] = present_family;
 
-	if( transfer_family != graphics_family && transfer_family != present_family )
+	if(	transfer_family != graphics_family && transfer_family != present_family )
 		unique_families_array[families_amount++] = transfer_family;
 
 	struct VkDeviceQueueCreateInfo * queue_create_informations_array;
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			&queue_create_informations_array, families_amount,
 			sizeof(*queue_create_informations_array)
 		) == false )
-	{
 		return "(vsr_device_logical_create) allocation size overflow";
-	} else if ( queue_create_informations_array == NULL ) {
+	else if ( queue_create_informations_array == NULL )
 		return "(vsr_device_logical_create) queue create information failed to allocate";
-	}
 
 	/* priority in [ 0.0f; 1.0f ] */
 	const float queue_priority = 1.0f;
@@ -1924,8 +2281,6 @@ static const char * vsr_device_logical_create(
 		};
 	}
 
-	struct VkPhysicalDeviceFeatures device_features = { 0 };
-
 	VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swap_chains_maintenance1_features = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
 		.swapchainMaintenance1 = VK_TRUE
@@ -1934,46 +2289,26 @@ static const char * vsr_device_logical_create(
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES_KHR,
 		.imagelessFramebuffer	= VK_TRUE
 	};
-	void * features_chain_pointer = NULL;
 
-	if( application_pointer->capabilities_device.has_swapchain_maintenance_1 == true ) {
+	void * features_chain_pointer = NULL;
+	if(	application_pointer->capabilities_device.has_swapchain_maintenance_1 == true ) {
 		swap_chains_maintenance1_features.pNext	= features_chain_pointer;
 		features_chain_pointer					= &swap_chains_maintenance1_features;
 	}
-	if( application_pointer->capabilities_device.has_imageless_frame_buffer == true ) {
+	if(	application_pointer->capabilities_device.has_imageless_frame_buffer == true ) {
 		imageless_features.pNext				= features_chain_pointer;
 		features_chain_pointer					= &imageless_features;
 	}
 
-	const char * extensions_enabled_array[VSR_EXTENSIONS_AMOUNT_DEVICE_MAXIMAL];
-	struct VSR_Extension_Names_Mutable extensions_enabled = {
-		.data_pointer	= extensions_enabled_array,
-		.amount			= VSR_EXTENSIONS_AMOUNT_DEVICE_MAXIMAL
-	};
-	vsr_device_extensions_enabled_array_fill(
-		application_pointer, &extensions_enabled
+	const char * error_message_pointer = vsr_device_create(
+		application_pointer, features_chain_pointer, families_amount,
+		queue_create_informations_array
 	);
-	struct VkDeviceCreateInfo create_information = {
-		.sType					= VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-		.pNext					= features_chain_pointer,
-		.queueCreateInfoCount	= (uint32_t) families_amount,
-		.pQueueCreateInfos		= queue_create_informations_array,
-		.enabledExtensionCount	= extensions_enabled.amount,
-		.ppEnabledExtensionNames= extensions_enabled.data_pointer,
-		.pEnabledFeatures		= &device_features
-	};
-
-	VkDevice device_temporary;
-	if( vkCreateDevice(
-			application_pointer->device_physical, &create_information, NULL, &device_temporary
-		) != VK_SUCCESS )
-	{
-		free( queue_create_informations_array );
-		return "(vsr_device_logical_create) logical device failed to create";
-	}
-	application_pointer->device = device_temporary;
-
 	free( queue_create_informations_array );
+
+	if(	error_message_pointer != NULL )
+		return error_message_pointer;
+
 	vkGetDeviceQueue(
 		application_pointer->device, application_pointer->queue_family_indices.graphics_family,
 		0, &application_pointer->graphics_queue
@@ -1982,7 +2317,7 @@ static const char * vsr_device_logical_create(
 		application_pointer->device, application_pointer->queue_family_indices.present_family,
 		0, &application_pointer->present_queue
 	);
-	if( application_pointer->queue_family_indices.has_transfer_family == true ) {
+	if(	application_pointer->queue_family_indices.has_transfer_family == true ) {
 		vkGetDeviceQueue(
 			application_pointer->device,
 			application_pointer->queue_family_indices.transfer_family, 0,
@@ -1995,25 +2330,57 @@ static const char * vsr_device_logical_create(
 	return NULL;
 }
 
+static const char * vsr_device_create(
+		struct VSR_Application * restrict application_pointer,
+		void * restrict features_chain_pointer, uint32_t families_amount,
+		struct VkDeviceQueueCreateInfo * restrict queue_create_informations_array
+	)
+{
+	const char * extensions_enabled_array[VSR_EXTENSIONS_AMOUNT_DEVICE_MAXIMAL];
+	struct VSR_Extension_Names_Mutable extensions_enabled = {
+		.data_pointer	= extensions_enabled_array,
+		.amount			= VSR_EXTENSIONS_AMOUNT_DEVICE_MAXIMAL
+	};
+	vsr_device_extensions_enabled_array_fill(
+		application_pointer, &extensions_enabled
+	);
+	struct VkDeviceCreateInfo create_information = {
+		.sType					= VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+		.pNext					= features_chain_pointer,
+		.queueCreateInfoCount	= families_amount,
+		.pQueueCreateInfos		= queue_create_informations_array,
+		.enabledExtensionCount	= extensions_enabled.amount,
+		.ppEnabledExtensionNames= extensions_enabled.data_pointer
+	};
+
+	if(	vkCreateDevice_wrapped(
+			application_pointer->device_physical, &create_information, NULL,
+			&application_pointer->device
+		) != VK_SUCCESS )
+		return "(vsr_device_create) logical device failed to create";
+
+	return NULL;
+}
+
 static bool vsr_device_physical_select( struct VSR_Application * restrict application_pointer ) {
 	assert_m( application_pointer != NULL, "No application found" );
 
 	uint32_t devices_amount = 0;
-	if( vkEnumeratePhysicalDevices(
+	if(	vkEnumeratePhysicalDevices(
 			application_pointer->instance, &devices_amount, NULL
 		) != VK_SUCCESS )
 	{
-		woem_push( "(vsr_device_physical_select) enumeration physical devcies failed" );
+		woem_push( "(vsr_device_physical_select) enumeration physical devices failed" );
 		return false;
 	}
 
-	if( devices_amount == 0 ) {
+	if(	devices_amount == 0 ) {
 		woem_push( "(vsr_device_physical_select) no GPUs with Vulkan support was found" );
 		return false;
 	}
 
 	VkPhysicalDevice * devices_pointer;
-	if( sa_malloc_array( &devices_pointer, devices_amount, sizeof(*devices_pointer) ) == false ) {
+	if(	sa_malloc_array( &devices_pointer, devices_amount, sizeof(*devices_pointer) ) == false ) {
 		woem_push( "(vsr_device_physical_select) allocation size overflow" );
 		return false;
 	} else if ( devices_pointer == NULL ) {
@@ -2024,32 +2391,26 @@ static bool vsr_device_physical_select( struct VSR_Application * restrict applic
 	VkResult result = vkEnumeratePhysicalDevices(
 		application_pointer->instance, &devices_amount, devices_pointer
 	);
-	if( result != VK_SUCCESS && assert_check_mf(
-		result != VK_INCOMPLETE, "lack of memory to enumerate %u physical devcies", devices_amount
+	if(	result != VK_SUCCESS && assert_check_mf(
+		result != VK_INCOMPLETE, "lack of memory to enumerate %u physical devices", devices_amount
 		) == true )
 	{
 		free( devices_pointer );
-		woem_push( "(vsr_device_physical_select) retrieving physical devcies failed" );
+		woem_push( "(vsr_device_physical_select) retrieving physical devices failed" );
 		return false;
 	}
 
-	struct GPU_choose {
-		uint32_t						score;
-		VkPhysicalDevice				device;
-		struct VSR_Capabilities_Device	device_capabilities;
-	} best_gpu = { 0, VK_NULL_HANDLE, { 0 } };
-
+	struct VSR_Device_Candidate candidate_best = {0};
 	uint32_t rated_gpus_amount = 0;
 	const char * error_message_pointer_last = NULL;
-	for ( uint32_t device_current = 0; device_current < devices_amount; ++device_current ) {
-		uint32_t current_score;
-		struct VSR_Capabilities_Device device_capabilities_current;
-		const char * error_message_pointer_current = NULL;
-		if((error_message_pointer_current = vsr_device_suitability_rate(
-				application_pointer, devices_pointer[device_current], &current_score,
-				&device_capabilities_current
-			)) != NULL )
-		{
+	for ( uint32_t device_current = 0; device_current < devices_amount; ++device_current )
+	{
+		struct VSR_Device_Candidate candidate_current = {0};
+		const char * error_message_pointer_current = vsr_device_suitability_rate(
+			application_pointer, devices_pointer[device_current], &candidate_current
+		);
+
+		if(	error_message_pointer_current != NULL ) {
 			VSR_DEBUG_LOGF(
 				"Warning (vsr_device_physical_select): GPU %u skipped: %s",
 				device_current, error_message_pointer_current
@@ -2058,37 +2419,31 @@ static bool vsr_device_physical_select( struct VSR_Application * restrict applic
 			continue;
 		}
 		++rated_gpus_amount;
-		if( current_score > best_gpu.score )
-			best_gpu = (struct GPU_choose) {
-				current_score,
-				devices_pointer[device_current],
-				device_capabilities_current
-			};
+		if(	candidate_current.score > candidate_best.score )
+			candidate_best = candidate_current;
 	}
 	free( devices_pointer );
 
-	if( best_gpu.score == 0 ) {
-		if( rated_gpus_amount == 0 )
-			woem_push("(vsr_device_physical_select) machine broken; %s", error_message_pointer_last);
+	VSR_DEBUG_LOGF( "\nbest gpu score: %u\n", candidate_best.score );
+
+	if(	candidate_best.score == 0 ) {
+		if(	rated_gpus_amount == 0 )
+			woem_push(
+				"(vsr_device_physical_select) machine broken; %s", error_message_pointer_last
+			);
 		else
 			woem_push( "(vsr_device_physical_select) suitable GPU wasn't found" );
 		return false;
 	}
 
-	application_pointer->device_physical	= best_gpu.device;
-	application_pointer->capabilities_device= best_gpu.device_capabilities;
+	application_pointer->device_physical			= candidate_best.device;
+	application_pointer->capabilities_device		= candidate_best.capabilities;
+	application_pointer->queue_family_indices		= candidate_best.queue_family_indices;
+	application_pointer->image_dimension_2d_maximal	= candidate_best.image_dimension_2d_maximal;
+
 	vkGetPhysicalDeviceMemoryProperties(
 		application_pointer->device_physical, &application_pointer->memory_properties
 	);
-	
-	if((error_message_pointer_last = vsr_queue_families_find(
-			application_pointer->surface, application_pointer->device_physical,
-			&application_pointer->queue_family_indices
-		)) != NULL )
-	{
-		woem_push( "%s", error_message_pointer_last );
-		return false;
-	}
 
 	return true;
 }
@@ -2103,16 +2458,16 @@ static const char * vsr_queue_families_find(
 	uint32_t queue_families_amount;
 	vkGetPhysicalDeviceQueueFamilyProperties( device, &queue_families_amount, NULL );
 
-	if( queue_families_amount == 0 )
+	if(	queue_families_amount == 0 )
 		return "(vsr_queue_families_find) no queue families found";
 
 	struct VkQueueFamilyProperties queue_families_array[VSR_LIMIT_STACK_FAMILIES];
 	struct VkQueueFamilyProperties * queue_families_pointer;
 
-	if( queue_families_amount <= VSR_LIMIT_STACK_FAMILIES ) {
+	if(	queue_families_amount <= VSR_LIMIT_STACK_FAMILIES ) {
 		queue_families_pointer = queue_families_array;
 	} else {
-		if( sa_malloc_array(
+		if(	sa_malloc_array(
 				&queue_families_pointer, queue_families_amount, sizeof(*queue_families_pointer)
 			) == false )
 			return "(vsr_queue_families_find) allocation size overflow";
@@ -2129,7 +2484,7 @@ static const char * vsr_queue_families_find(
 	for ( uint32_t queue_family_index = 0;
 			queue_family_index < queue_families_amount; ++queue_family_index )
 	{
-		if( queue_families_pointer[queue_family_index].queueFlags & VK_QUEUE_GRAPHICS_BIT ) {
+		if(	queue_families_pointer[queue_family_index].queueFlags & VK_QUEUE_GRAPHICS_BIT ) {
 			indices.graphics_family = queue_family_index;
 			indices.has_graphics_family = true;
 		}
@@ -2139,18 +2494,18 @@ static const char * vsr_queue_families_find(
 					device, queue_family_index, surface, &present_family_supported
 				) != VK_SUCCESS)
 			{
-				if( memory_was_dynamically_allocated == true )
+				if(	memory_was_dynamically_allocated == true )
 					free( queue_families_pointer );
 				return "(vsr_queue_families_find) physical device surface support failed to get";
 			}
-			if( present_family_supported == true ) {
+			if(	present_family_supported == true ) {
 				indices.present_family = queue_family_index;
 				indices.has_present_family = true;
 			}
 
 			if((queue_families_pointer[queue_family_index].queueFlags & VK_QUEUE_TRANSFER_BIT)!= 0)
 			{
-				if( (queue_families_pointer[queue_family_index].queueFlags &
+				if(	(queue_families_pointer[queue_family_index].queueFlags &
 						(VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT )) == 0 )
 				{
 					indices.transfer_family = queue_family_index;
@@ -2158,14 +2513,14 @@ static const char * vsr_queue_families_find(
 				}
 			}
 
-			if( vsr_queue_family_indices_is_complete( &indices )== true &&
+			if(	vsr_queue_family_indices_is_complete( &indices )== true &&
 				indices.has_transfer_family == true )
 				break;
 	}
-	if( memory_was_dynamically_allocated == true )
+	if(	memory_was_dynamically_allocated == true )
 		free( queue_families_pointer );
 
-	if( indices.has_transfer_family == false && indices.has_graphics_family == true )
+	if(	indices.has_transfer_family == false && indices.has_graphics_family == true )
 		indices.transfer_family = indices.graphics_family;
 
 	*out_queue_family_indices_pointer = indices;
@@ -2191,7 +2546,7 @@ static const char * vsr_surface_is_support_available(
 	assert_m( formats_amount_pointer		!= NULL, "No formats amount storage found"		);
 	assert_m( present_modes_amount_pointer	!= NULL, "No present modes amount storage found");
 
-	if( vkGetPhysicalDeviceSurfaceFormatsKHR(
+	if(	vkGetPhysicalDeviceSurfaceFormatsKHR(
 			device, surface, formats_amount_pointer, NULL
 		) != VK_SUCCESS )
 		return "(vsr_surface_is_support_available) getting surface formats amount failed";
@@ -2211,30 +2566,30 @@ static bool vsr_device_extensions_get(
 {
 	assert_m( out_extensions_pointer != NULL, "No extensions storage found" );
 
-	if( vkEnumerateDeviceExtensionProperties(
+	if(	vkEnumerateDeviceExtensionProperties(
 			device, NULL, &out_extensions_pointer->amount, NULL
 		) != VK_SUCCESS ||
 		out_extensions_pointer->amount == 0 )
 		return false;
 
-	if( out_extensions_pointer->amount <= VSR_LIMIT_STACK_EXTENSIONS )
+	if(	out_extensions_pointer->amount <= VSR_LIMIT_STACK_EXTENSIONS )
 		out_extensions_pointer->data_pointer = out_extensions_array_stack;
 	else {
-		if( sa_malloc_array(
+		if(	sa_malloc_array(
 				&out_extensions_pointer->data_pointer, out_extensions_pointer->amount,
 				sizeof(*out_extensions_pointer->data_pointer)
 			) == false )
 		{
 			assert_mf(0, "extensions amount (%u) overflow", out_extensions_pointer->amount );
 			return false;
-		} else if( out_extensions_pointer->data_pointer == NULL )
+		} else if(	out_extensions_pointer->data_pointer == NULL )
 			return false;
 	}
-	if( vkEnumerateDeviceExtensionProperties(
+	if(	vkEnumerateDeviceExtensionProperties(
 			device, NULL, &out_extensions_pointer->amount, out_extensions_pointer->data_pointer
 		) != VK_SUCCESS )
 	{
-		if( out_extensions_pointer->data_pointer != out_extensions_array_stack )
+		if(	out_extensions_pointer->data_pointer != out_extensions_array_stack )
 			free( out_extensions_pointer->data_pointer );
 		return false;
 	}
@@ -2256,7 +2611,7 @@ static void vsr_device_extensions_enabled_array_fill(
 	);
 	out_extensions_pointer->amount = global_device_extensions_required.amount;
 
-	if( application_pointer->capabilities_device.has_swapchain_maintenance_1 == true ) {
+	if(	application_pointer->capabilities_device.has_swapchain_maintenance_1 == true ) {
 		memcpy(
 			out_extensions_pointer->data_pointer + out_extensions_pointer->amount,
 			global_device_extensions_swapchain_maintenance_1.data_pointer,
@@ -2266,7 +2621,7 @@ static void vsr_device_extensions_enabled_array_fill(
 		out_extensions_pointer->amount += VSR_EXTENSIONS_AMOUNT_DEVICE_SWAPCHAIN_MAINTENANCE_1;
 	}
 
-	if( application_pointer->capabilities_device.has_imageless_frame_buffer == true ) {
+	if(	application_pointer->capabilities_device.has_imageless_frame_buffer == true ) {
 		memcpy(
 			out_extensions_pointer->data_pointer + out_extensions_pointer->amount,
 			global_device_extensions_imageless_frame_buffer.data_pointer,
@@ -2278,7 +2633,7 @@ static void vsr_device_extensions_enabled_array_fill(
 }
 
 static void vsr_device_extension_required_check(
-		VkPhysicalDevice device, PFN_vkGetPhysicalDeviceFeatures2KHR funtion_get_features_2,
+		VkPhysicalDevice device, PFN_vkGetPhysicalDeviceFeatures2KHR function_get_features_2,
 		struct VSR_Capabilities_Device * restrict out_capabilities_pointer
 	)
 {
@@ -2296,7 +2651,7 @@ static void vsr_device_extension_required_check(
 		.pNext = &feature_imageless_frame_buffer
 	};
 
-	funtion_get_features_2( device, &device_physical_feature_2 );
+	function_get_features_2( device, &device_physical_feature_2 );
 
 	*out_capabilities_pointer = (struct VSR_Capabilities_Device) {
 		.has_swapchain_maintenance_1=
@@ -2306,30 +2661,78 @@ static void vsr_device_extension_required_check(
 	};
 }
 
-static const char * vsr_device_suitability_rate(
-		struct VSR_Application * restrict application_pointer, VkPhysicalDevice device,
-		uint32_t * restrict out_scores_pointer,
-		struct VSR_Capabilities_Device * restrict out_capabilities_device_pointer
+static bool vsr_device_present_scaling_stretch_check(
+		VkPhysicalDevice device, VkSurfaceKHR surface,
+		const struct VSR_Capabilities_Vulkan * restrict instance_capabilities_pointer
 	)
 {
-	assert_m(application_pointer			!= NULL, "No application found"					);
-	assert_m(out_scores_pointer				!= NULL, "No scores storage found"				);
-	assert_m(out_capabilities_device_pointer!= NULL, "No device capabilities storage found"	);
+	if(	instance_capabilities_pointer->get_physical_device_surface_capabilities_2 == NULL ) {
+		VSR_DEBUG_LOG(
+			"(vsr_device_present_scaling_stretch_check) Warning: "
+			"capabilities query function is not available; assuming unsupported"
+		);
+		return false;
+	}
+
+	VkSurfacePresentModeKHR present_mode = {
+		.sType		= VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR,
+		.presentMode= VK_PRESENT_MODE_FIFO_KHR
+	};
+	VkPhysicalDeviceSurfaceInfo2KHR surface_information = {
+		.sType	= VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+		.surface= surface,
+		.pNext	= &present_mode
+	};
+	VkSurfacePresentScalingCapabilitiesEXT scaling_capabilities = {
+		.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_EXT
+	};
+	VkSurfaceCapabilities2KHR surface_capabilities = {
+		.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+		.pNext = &scaling_capabilities
+	};
+
+	if(	instance_capabilities_pointer->get_physical_device_surface_capabilities_2(
+			device, &surface_information, &surface_capabilities
+		) != VK_SUCCESS )
+	{
+		VSR_DEBUG_LOG(
+			"(vsr_device_present_scaling_stretch_check) Warning: "
+			"querying display capabilities failed; assuming unsupported"
+		);
+		return false;
+	}
+
+	return
+		(scaling_capabilities.supportedPresentScaling & VK_PRESENT_SCALING_STRETCH_BIT_EXT) != 0;
+}
+
+static const char * vsr_device_suitability_rate(
+		struct VSR_Application * restrict application_pointer, VkPhysicalDevice device,
+		struct VSR_Device_Candidate * restrict out_candidate_pointer
+	)
+{
+	assert_m(application_pointer	!= NULL, "No application found"		);
+	assert_m(out_candidate_pointer	!= NULL, "No scores storage found"	);
 
 	VkPhysicalDeviceProperties device_properties;
 	vkGetPhysicalDeviceProperties( device, &device_properties );
+	if(	device_properties.limits.maxImageDimension2D > VSR_LIMIT_EXTENT_MAXIMAL )
+		return "(vsr_device_suitability_rate) maxImageDimension2D exceeds hard limit";
 
 	const char * error_message_pointer;
-	struct VSR_Queue_Family_Indices indices;
 	if((error_message_pointer = vsr_queue_families_find(
-			application_pointer->surface, device, &indices
+			application_pointer->surface, device, &out_candidate_pointer->queue_family_indices
 		)) != NULL )
 		return error_message_pointer;
 
-	*out_scores_pointer = 0;
-	if( vsr_queue_family_indices_is_complete( &indices ) == false ||
+	out_candidate_pointer->device = device;
+	out_candidate_pointer->score = 0;
+	if(	vsr_queue_family_indices_is_complete(
+			&out_candidate_pointer->queue_family_indices
+		) == false ||
 		vsr_device_capabilities_build(
-			device, &application_pointer->capabilities_vulkan, out_capabilities_device_pointer
+			device, application_pointer->surface,
+			&application_pointer->capabilities_vulkan, &out_candidate_pointer->capabilities
 		) == false )
 		return NULL;
 
@@ -2338,22 +2741,30 @@ static const char * vsr_device_suitability_rate(
 			application_pointer->surface, device, &formats_amount, &present_modes_amount
 		)) != NULL )
 		return error_message_pointer;
-	if( formats_amount == 0 || present_modes_amount == 0 )
+	if(	formats_amount == 0 || present_modes_amount == 0 )
 		return NULL;
 
-	uint32_t scores = 0;
-	if( device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU )
-		scores += 1000;
-	if( indices.has_transfer_family == true )
-		scores += 500;
-	if( out_capabilities_device_pointer->has_swapchain_maintenance_1 == true )
-		scores += 250;
-	if( out_capabilities_device_pointer->has_imageless_frame_buffer == true )
-		scores += 250;
+	if(	device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU )
+		out_candidate_pointer->score += 1000;
+	if(	out_candidate_pointer->queue_family_indices.has_transfer_family== true )
+		out_candidate_pointer->score += 500;
+	if(	out_candidate_pointer->capabilities.has_imageless_frame_buffer == true )
+		out_candidate_pointer->score += 250;
+	if(	out_candidate_pointer->capabilities.has_swapchain_maintenance_1== true )
+		out_candidate_pointer->score += 250;
+	if(	out_candidate_pointer->capabilities.has_present_scaling_stretch== true )
+		out_candidate_pointer->score += 125;
 
-	scores += device_properties.limits.maxImageDimension2D;
+	out_candidate_pointer->score += device_properties.limits.maxImageDimension2D;
+	out_candidate_pointer->image_dimension_2d_maximal =
+		device_properties.limits.maxImageDimension2D;
 
-	*out_scores_pointer = scores;
+#ifndef NDEBUG
+	vsr_debug_gpu_print(
+		device_properties, out_candidate_pointer->capabilities, out_candidate_pointer->score
+	);
+#endif
+
 	return NULL;
 }
 
@@ -2363,11 +2774,11 @@ static void vsr_swap_chain_support_details_free(
 {
 	assert_m( swap_chain_support_pointer != NULL, "No swap chain support data found" );
 
-	if( swap_chain_support_pointer->surface_formats_pointer ) {
+	if(	swap_chain_support_pointer->surface_formats_pointer ) {
 		free( swap_chain_support_pointer->surface_formats_pointer );
 		swap_chain_support_pointer->surface_formats_pointer = NULL;
 	}
-	if( swap_chain_support_pointer->present_modes_pointer ) {
+	if(	swap_chain_support_pointer->present_modes_pointer ) {
 		free( swap_chain_support_pointer->present_modes_pointer );
 		swap_chain_support_pointer->present_modes_pointer = NULL;
 	}
@@ -2380,19 +2791,19 @@ static const char * vsr_swap_chain_support_query(
 {
 	assert_m(out_swap_chain_support_details_pointer != NULL,"No swapchain support storage found");
 
-	if( vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+	if(	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 			device, surface, &out_swap_chain_support_details_pointer->surface_capabilities
 		) != VK_SUCCESS )
 		return "(vsr_swap_chain_support_query) surface capabilities failed to get";
 
 	uint32_t formats_amount;
-	if( vkGetPhysicalDeviceSurfaceFormatsKHR(
+	if(	vkGetPhysicalDeviceSurfaceFormatsKHR(
 			device, surface, &formats_amount, NULL
 		) != VK_SUCCESS )
 		return "(vsr_swap_chain_support_query) surface formats failed to get amount";
 
-	if( formats_amount != 0 ) {
-		if( sa_malloc_array(
+	if(	formats_amount != 0 ) {
+		if(	sa_malloc_array(
 				&out_swap_chain_support_details_pointer->surface_formats_pointer,
 				formats_amount,
 				sizeof(*out_swap_chain_support_details_pointer->surface_formats_pointer)
@@ -2401,7 +2812,7 @@ static const char * vsr_swap_chain_support_query(
 		else if ( out_swap_chain_support_details_pointer->surface_formats_pointer == NULL )
 			return "(vsr_swap_chain_support_query) surface format allocation failed";
 
-		if( vkGetPhysicalDeviceSurfaceFormatsKHR(
+		if(	vkGetPhysicalDeviceSurfaceFormatsKHR(
 				device, surface, &formats_amount,
 				out_swap_chain_support_details_pointer->surface_formats_pointer
 			) != VK_SUCCESS )
@@ -2413,7 +2824,7 @@ static const char * vsr_swap_chain_support_query(
 	out_swap_chain_support_details_pointer->formats_amount = formats_amount;
 
 	uint32_t present_modes_amount;
-	if( vkGetPhysicalDeviceSurfacePresentModesKHR(
+	if(	vkGetPhysicalDeviceSurfacePresentModesKHR(
 			device, surface, &present_modes_amount, NULL
 		) != VK_SUCCESS )
 	{
@@ -2421,8 +2832,8 @@ static const char * vsr_swap_chain_support_query(
 		return "(vsr_swap_chain_support_query) surface present modes failed to get amount";
 	}
 
-	if( present_modes_amount != 0 ) {
-		if( sa_malloc_array(
+	if(	present_modes_amount != 0 ) {
+		if(	sa_malloc_array(
 				&out_swap_chain_support_details_pointer->present_modes_pointer,
 				present_modes_amount,
 				sizeof(*out_swap_chain_support_details_pointer->present_modes_pointer)
@@ -2435,7 +2846,7 @@ static const char * vsr_swap_chain_support_query(
 			return "(vsr_swap_chain_support_query) present modes allocation failed";
 		}
 
-		if( vkGetPhysicalDeviceSurfacePresentModesKHR(
+		if(	vkGetPhysicalDeviceSurfacePresentModesKHR(
 				device, surface, &present_modes_amount,
 				out_swap_chain_support_details_pointer->present_modes_pointer
 			) != VK_SUCCESS)
@@ -2449,35 +2860,33 @@ static const char * vsr_swap_chain_support_query(
 	return NULL;
 }
 
-static const char * vsr_synchronization_objects_create(
+static const char * vsr_synchronization_frames_create(
 		struct VSR_Application * restrict application_pointer
 	)
 {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( sa_malloc_array(
-			&application_pointer->synchronization_objects_pointer,
+	if(	sa_malloc_array(
+			&application_pointer->synchronization_frame_pointer,
 			application_pointer->frames_in_flight_limit,
-			sizeof(*application_pointer->synchronization_objects_pointer)
+			sizeof(*application_pointer->synchronization_frame_pointer)
 		) == false )
-		return "(vsr_synchronization_objects_create) allocation size overflow";
-	else if ( application_pointer->synchronization_objects_pointer == NULL )
-		return "(vsr_synchronization_objects_create) synchronization objects allocation failed";
+		return "(vsr_synchronization_frames_create) allocation size overflow";
+	else if ( application_pointer->synchronization_frame_pointer == NULL )
+		return "(vsr_synchronization_frames_create) synchronization objects allocation failed";
 
-	for( uint8_t object_synchronization = 0;
-		object_synchronization < application_pointer->frames_in_flight_limit;
-		++object_synchronization )
+	for(uint8_t frame_index = 0;
+			frame_index < application_pointer->frames_in_flight_limit;
+				++frame_index )
 	{
-		struct VSR_Synchronization_Objects * synchronization_object_pointer =
-			&application_pointer->synchronization_objects_pointer[object_synchronization];
+		struct VSR_Synchronization_Frame * synchronization_frame_pointer =
+			&application_pointer->synchronization_frame_pointer[frame_index];
 		const char * error_message_pointer;
-		if((error_message_pointer = vsr_synchronization_object_create(
-				application_pointer, synchronization_object_pointer
+		if((error_message_pointer = vsr_synchronization_frame_create(
+				application_pointer, synchronization_frame_pointer
 			)) != NULL )
 		{
-			vsr_synchronization_objects_destroy(application_pointer, object_synchronization);
-			free( application_pointer->synchronization_objects_pointer );
-			application_pointer->synchronization_objects_pointer = NULL;
+			vsr_synchronization_frames_destroy(application_pointer, frame_index);
 			return error_message_pointer;
 		}
 	}
@@ -2485,13 +2894,121 @@ static const char * vsr_synchronization_objects_create(
 	return NULL;
 }
 
-static const char * vsr_synchronization_object_create(
+static const char * vsr_synchronization_fence_present_create(
+		struct VSR_Application * restrict application_pointer,
+		VkFence ** restrict out_fences_pointer, uint32_t fences_to_create_amount
+	)
+{
+	assert_m( application_pointer!= NULL, "No application found"	);
+	assert_m( out_fences_pointer != NULL, "No fences storage found"	);
+
+	if(	sa_malloc_array(
+			out_fences_pointer, fences_to_create_amount, sizeof(**out_fences_pointer)
+		) == false )
+		return "(vsr_synchronization_fence_present_create) allocation size overflow";
+	else if ( *out_fences_pointer == NULL )
+		return
+			"(vsr_synchronization_fence_present_create) fences memory allocation failed";
+
+	struct VkFenceCreateInfo fence_create_information = {
+		.sType	= VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+		.flags	= VK_FENCE_CREATE_SIGNALED_BIT
+	};
+
+	for(uint32_t fence_index_create = 0;
+			fence_index_create < fences_to_create_amount;
+				++fence_index_create )
+	{
+		if(	vkCreateFence(
+				application_pointer->device, &fence_create_information, NULL,
+				&(*out_fences_pointer)[fence_index_create]
+			) != VK_SUCCESS )
+		{
+			vsr_synchronization_fence_present_destroy(
+				application_pointer->device, *out_fences_pointer, fence_index_create
+			);
+			*out_fences_pointer = NULL;
+			return "(vsr_synchronization_fence_present_create) fences creation failed";
+		}
+	}
+
+	return NULL;
+}
+
+static void vsr_synchronization_fence_present_destroy(
+		VkDevice device, VkFence * restrict fences_pointer, uint32_t fences_amount
+	)
+{
+	for(uint32_t fence_index_destroy = 0;
+			fence_index_destroy < fences_amount;
+				++fence_index_destroy )
+		vkDestroyFence( device, fences_pointer[fence_index_destroy], NULL );
+
+	free( fences_pointer );
+}
+
+static const char * vsr_synchronization_semaphores_render_finished_create(
+		struct VSR_Application * restrict application_pointer,
+		VkSemaphore ** restrict out_semaphores_pointer, uint32_t semaphores_amount
+	)
+{
+	assert_m( application_pointer	!= NULL, "No application found"			);
+	assert_m( out_semaphores_pointer!= NULL, "No semaphores storage found"	);
+
+	if(	sa_malloc_array(
+			out_semaphores_pointer, semaphores_amount, sizeof(**out_semaphores_pointer)
+		) == false )
+		return "(vsr_synchronization_semaphores_render_finished_create) allocation size overflow";
+	else if ( *out_semaphores_pointer == NULL )
+		return
+			"(vsr_synchronization_semaphores_render_finished_create) "
+			"semaphores memory allocation failed";
+
+	struct VkSemaphoreCreateInfo semaphore_create_information = {
+		.sType	= VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+	};
+	for(uint32_t semaphore_index_create = 0;
+			semaphore_index_create < semaphores_amount;
+				++semaphore_index_create )
+	{
+		if(	vkCreateSemaphore(
+				application_pointer->device, &semaphore_create_information, NULL,
+				&(*out_semaphores_pointer)[semaphore_index_create]
+			) != VK_SUCCESS )
+		{
+			vsr_synchronization_semaphores_render_finished_destroy(
+				application_pointer->device, *out_semaphores_pointer, semaphore_index_create
+			);
+			return
+				"(vsr_synchronization_semaphores_render_finished_create) "
+				"semaphores creation failed";
+		}
+	}
+
+	return NULL;
+}
+
+static void vsr_synchronization_semaphores_render_finished_destroy(
+		VkDevice device, VkSemaphore * restrict semaphores_pointer, uint32_t semaphores_amount
+	)
+{
+	assert_m( semaphores_pointer != NULL, "No semaphores found"	);
+
+	for(uint32_t semaphore_index_destroy = 0;
+			semaphore_index_destroy < semaphores_amount;
+				++semaphore_index_destroy )
+		vkDestroySemaphore( device, semaphores_pointer[semaphore_index_destroy], NULL );
+
+	free( semaphores_pointer );
+}
+
+static const char * vsr_synchronization_frame_create(
 		const struct VSR_Application * restrict application_pointer,
-		struct VSR_Synchronization_Objects * restrict synchronization_object_pointer
+		struct VSR_Synchronization_Frame * restrict synchronization_frame_pointer
 	)
 {
 	assert_m( application_pointer			!= NULL, "No application found"						);
-	assert_m( synchronization_object_pointer!= NULL, "No synchronization object storage found"	);
+	assert_m( synchronization_frame_pointer	!= NULL, "No synchronization object storage found"	);
 
 	struct VkSemaphoreCreateInfo semaphore_create_information = {
 		.sType	= VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
@@ -2502,91 +3019,51 @@ static const char * vsr_synchronization_object_create(
 		.flags	= VK_FENCE_CREATE_SIGNALED_BIT
 	};
 
-	if( vkCreateSemaphore(
+	if(	vkCreateSemaphore(
 			application_pointer->device, &semaphore_create_information, NULL,
-			&synchronization_object_pointer->image_available_semaphore
+			&synchronization_frame_pointer->image_available_semaphore
 		) != VK_SUCCESS )
-		return "(vsr_synchronization_object_create) image available semaphore creation failed";
+		return "(vsr_synchronization_frame_create) image available semaphore creation failed";
 
-	const char * error_message_pointer;
-	if( vkCreateSemaphore(
-			application_pointer->device, &semaphore_create_information, NULL,
-			&synchronization_object_pointer->render_finished_semaphore
-		) != VK_SUCCESS )
-	{
-		error_message_pointer =
-			"(vsr_synchronization_object_create) render finished semaphore creation failed";
-		goto cleanup;
-	}
-	if( vkCreateFence(
+	if(	vkCreateFence(
 			application_pointer->device, &fence_create_information, NULL,
-			&synchronization_object_pointer->in_flight_fence
+			&synchronization_frame_pointer->in_flight_fence
 		) != VK_SUCCESS )
 	{
-		error_message_pointer =
-			"(vsr_synchronization_object_create) in flight fence creation failed";
-		goto cleanup_semaphores;
-	}
-
-	if( vkCreateFence(
-			application_pointer->device, &fence_create_information, NULL,
-			&synchronization_object_pointer->present_fence
-		) != VK_SUCCESS )
-	{
-		error_message_pointer =
-			"(vsr_synchronization_object_create) present fence creation failed";
-		goto cleanup_fence;
+		vkDestroySemaphore(
+			application_pointer->device,
+			synchronization_frame_pointer->image_available_semaphore, NULL
+		);
+		return "(vsr_synchronization_frame_create) in flight fence creation failed";
 	}
 
 	return NULL;
-
-cleanup_fence:
-	vkDestroyFence(
-		application_pointer->device, synchronization_object_pointer->in_flight_fence, NULL
-	);
-
-cleanup_semaphores:
-	vkDestroySemaphore(
-		application_pointer->device, synchronization_object_pointer->render_finished_semaphore,
-		NULL
-	);
-
-cleanup:
-	vkDestroySemaphore(
-		application_pointer->device, synchronization_object_pointer->image_available_semaphore,
-		NULL
-	);
-	return error_message_pointer;
 }
 
-static void vsr_synchronization_objects_destroy(
-		struct VSR_Application * restrict application_pointer, uint8_t objects_amount
+static void vsr_synchronization_frames_destroy(
+		struct VSR_Application * restrict application_pointer, uint8_t frames_amount
 	)
 {
 	assert_m( application_pointer != NULL, "No application found" );
 	assert_m(
-		objects_amount <= application_pointer->frames_in_flight_limit,
-		"Excess objects to delete"
+		frames_amount <= application_pointer->frames_in_flight_limit,
+		"Excess frames to delete"
 	);
 
-	for ( uint8_t object_deletion = 0; object_deletion < objects_amount; ++object_deletion ) {
-		struct VSR_Synchronization_Objects * synchronization_object_pointer =
-			&application_pointer->synchronization_objects_pointer[object_deletion];
+	for ( uint8_t frame_index = 0; frame_index < frames_amount; ++frame_index ) {
+		struct VSR_Synchronization_Frame * synchronization_frame_pointer =
+			&application_pointer->synchronization_frame_pointer[frame_index];
 		vkDestroySemaphore(
 			application_pointer->device,
-			synchronization_object_pointer->image_available_semaphore, NULL
-		);
-		vkDestroySemaphore(
-			application_pointer->device,
-			synchronization_object_pointer->render_finished_semaphore, NULL
+			synchronization_frame_pointer->image_available_semaphore, NULL
 		);
 		vkDestroyFence(
-			application_pointer->device, synchronization_object_pointer->in_flight_fence, NULL
-		);
-		vkDestroyFence(
-			application_pointer->device, synchronization_object_pointer->present_fence, NULL
+			application_pointer->device, synchronization_frame_pointer->in_flight_fence, NULL
 		);
 	}
+
+	free( application_pointer->synchronization_frame_pointer );
+	application_pointer->synchronization_frame_pointer = NULL;
 }
 
 static void vsr_projection_refresh(struct VSR_Application * restrict application_pointer) {
@@ -2613,13 +3090,16 @@ static void vsr_projection_refresh(struct VSR_Application * restrict application
 	application_pointer->frame_state.is_projection_dirty = false;
 }
 
-static void vsr_buffer_uniform_update(
-		struct VSR_Application * restrict application_pointer, uint32_t current_image
+static bool vsr_buffer_uniform_update(
+		struct VSR_Application * restrict application_pointer, uint32_t current_frame
 	)
 {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	application_pointer->spin_angle_current += application_pointer->spin_angle_rotation;
+	application_pointer->spin_angle_current = fmodf(
+		application_pointer->spin_angle_current + application_pointer->spin_angle_rotation,
+		VSR_LIMIT_TURNOVER
+	);
 
 	struct VSR_Uniform_Buffer_Object buffer_uniform_object;
 	glm_mat4_copy(
@@ -2632,7 +3112,7 @@ static void vsr_buffer_uniform_update(
 
 	/* in current context overflow is almost impossible */
 	VkDeviceSize size_offset =
-		current_image * application_pointer->buffer_uniform_alignment_size;
+		current_frame * application_pointer->buffer_uniform_size_alignment;
 
 	uint8_t * mapped_memory_pointer = (uint8_t *)
 		application_pointer->buffers_uniform_mapped_pointer;
@@ -2642,15 +3122,19 @@ static void vsr_buffer_uniform_update(
 		application_pointer->buffer_uniform_size
 	);
 
-	if( application_pointer->is_buffer_uniform_coherent == false ) {
+	if(	application_pointer->is_buffer_uniform_coherent == false ) {
 		struct VkMappedMemoryRange flush_range = {
 			.sType	= VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
 			.memory	= application_pointer->buffers_uniform_memory,
 			.offset	= size_offset,
-			.size	= application_pointer->buffer_uniform_alignment_size
+			.size	= application_pointer->buffer_uniform_size_flush
 		};
-		vkFlushMappedMemoryRanges( application_pointer->device, 1, &flush_range );
+		if(	vkFlushMappedMemoryRanges(
+				application_pointer->device, 1, &flush_range
+			) != VK_SUCCESS )
+			return false;
 	}
+	return true;
 }
 
 static void vsr_frame_discard(
@@ -2660,7 +3144,7 @@ static void vsr_frame_discard(
 	assert_m( application_pointer != NULL, "No application found" );
 
 	VkSemaphore wait_semaphores_pointer[] = {
-		application_pointer->synchronization_objects_pointer[application_pointer->current_frame].
+		application_pointer->synchronization_frame_pointer[application_pointer->current_frame].
 			image_available_semaphore
 	};
 	struct VkPresentInfoKHR presentation_information = {
@@ -2674,55 +3158,52 @@ static void vsr_frame_discard(
 	VkResult result = vkQueuePresentKHR(
 		application_pointer->present_queue, &presentation_information
 	);
-	if( result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR )
+	if(	result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR )
 		vsr_frame_render_failed(
 			application_pointer, "(vsr_frame_discard) discarding frame failed"
 		);
+	else ++application_pointer->frame_discarded_amount;
 }
 
 static VkResult vsr_frame_fences_wait(
 		const struct VSR_Application * restrict application_pointer,
-		const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer
+		const struct VSR_Synchronization_Frame * restrict synchronization_frame_pointer
 	)
 {
 	assert_m( application_pointer			!= NULL, "No application found"						);
-	assert_m( synchronization_object_pointer!= NULL, "No synchronization object storage found"	);
+	assert_m( synchronization_frame_pointer!= NULL, "No synchronization object storage found"	);
 
-	if( application_pointer->capabilities_device.has_swapchain_maintenance_1 == true )
+	if(	application_pointer->capabilities_device.has_swapchain_maintenance_1 == true )
 		return vkWaitForFences(
 			application_pointer->device, 2,
 			(VkFence[]) {
-				synchronization_object_pointer->in_flight_fence,
-				synchronization_object_pointer->present_fence
+				synchronization_frame_pointer->in_flight_fence,
+				application_pointer->present_fences_pointer[application_pointer->current_frame]
 			},
-			VK_TRUE, UINT64_MAX
+			VK_TRUE, VSR_LIMIT_TIME_WAIT_FENCE
 		);
 	return vkWaitForFences(
 		application_pointer->device, 1,
-		&synchronization_object_pointer->in_flight_fence,
-		VK_TRUE, UINT64_MAX
+		&synchronization_frame_pointer->in_flight_fence,
+		VK_TRUE, VSR_LIMIT_TIME_WAIT_FENCE
 	);
 }
 
-static bool vsr_frame_fence_present_reset(
-		struct VSR_Application * restrict application_pointer,
-		const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer
-	)
-{
-	assert_m( application_pointer			!= NULL, "No application found"						);
-	assert_m( synchronization_object_pointer!= NULL, "No synchronization object storage found"	);
+static bool vsr_frame_fence_present_reset(struct VSR_Application * restrict application_pointer) {
+	assert_m( application_pointer != NULL, "No application found" );
 
-	if( application_pointer->capabilities_device.has_swapchain_maintenance_1 == false )
+	if(	application_pointer->capabilities_device.has_swapchain_maintenance_1 == false )
 		return true;
 
-	if( vkResetFences(
-			application_pointer->device, 1, &synchronization_object_pointer->present_fence
+	if(	vkResetFences(
+			application_pointer->device, 1,
+			&application_pointer->present_fences_pointer[application_pointer->current_frame]
 		) == VK_SUCCESS )
 		return true;
 
-	if( vsr_device_recreate(application_pointer) == false )
+	if(	vsr_device_recreate(application_pointer) == false )
 		vsr_frame_render_failed(
-			application_pointer, "(vsr_frame_image_present) present fence reset failed"
+			application_pointer, "(vsr_frame_fence_present_reset) present fence reset failed"
 		);
 	return false;
 }
@@ -2730,22 +3211,29 @@ static bool vsr_frame_fence_present_reset(
 static void vsr_frame_draw(struct VSR_Application * restrict application_pointer) {
 	assert_m( application_pointer != NULL, "No application found" );
 
+	if(	application_pointer->frame_discarded_amount >= VSR_LIMIT_FAILURES_FRAME_DISCARD ) {
+		if(	vsr_device_recreate( application_pointer ) == false )
+			vsr_frame_render_failed(
+				application_pointer, "(vsr_frame_draw) drawing fails limit exceeded"
+			);
+		return;
+	}
+
 	/* only works properly because of scaling */
-	if( atomic_load_explicit(
-			&application_pointer->is_swap_chain_valid, memory_order_relaxed
+	if(	atomic_load_explicit(
+			&application_pointer->is_swap_chain_valid, memory_order_acquire
 		) == false &&
 		vsr_swap_chain_recreate( application_pointer ) == false )
 		return;
 
-	const struct VSR_Synchronization_Objects * synchronization_object_pointer =
-		&application_pointer->synchronization_objects_pointer
-			[application_pointer->current_frame];
+	const struct VSR_Synchronization_Frame * synchronization_frame_pointer =
+		&application_pointer->synchronization_frame_pointer[application_pointer->current_frame];
 
-	if( vsr_frame_fences_wait(
-			application_pointer, synchronization_object_pointer
+	if(	vsr_frame_fences_wait(
+			application_pointer, synchronization_frame_pointer
 		) != VK_SUCCESS )
 	{
-		if( vsr_device_recreate(application_pointer) == false )
+		if(	vsr_device_recreate(application_pointer) == false )
 			vsr_frame_render_failed(
 				application_pointer, "(vsr_frame_draw) waiting for in-flight fences failed"
 			);
@@ -2753,27 +3241,33 @@ static void vsr_frame_draw(struct VSR_Application * restrict application_pointer
 	}
 
 	uint32_t image_index;
-	if( vsr_frame_image_acquire(
-			application_pointer, synchronization_object_pointer, &image_index
+	if(	vsr_frame_image_acquire(
+			application_pointer, synchronization_frame_pointer, &image_index
 		) == false )
 		return;
 
-	vsr_buffer_uniform_update(application_pointer, application_pointer->current_frame);
+	if(	vsr_buffer_uniform_update(
+			application_pointer, application_pointer->current_frame
+		) == false )
+	{
+		VSR_DEBUG_LOG("(vsr_frame_draw) uniform buffer flush failed; skipping frame");
+		vsr_frame_discard( application_pointer, image_index );
+		return;
+	}
 
 	/* make sure command buffer is able to be recorded */
-	
-	if( vkResetCommandBuffer(
+	if(	vkResetCommandBuffer(
 			application_pointer->command_buffers_pointer[application_pointer->current_frame], 0
 		) != VK_SUCCESS )
 	{
-		if( vsr_device_recreate(application_pointer) == false )
+		if(	vsr_device_recreate(application_pointer) == false )
 			vsr_frame_render_failed(
 				application_pointer, "(vsr_frame_draw) command buffer reset failed"
 			);
 		return;
 	}
 
-	if( vsr_command_buffer_record(
+	if(	vsr_command_buffer_record(
 			application_pointer,
 			application_pointer->command_buffers_pointer[application_pointer->current_frame],
 			image_index
@@ -2783,44 +3277,72 @@ static void vsr_frame_draw(struct VSR_Application * restrict application_pointer
 		return;
 	}
 
-	if( vsr_frame_commands_submit(
-			application_pointer, synchronization_object_pointer, image_index
-		) == false )
-		return;
-
-	if( vsr_frame_image_present(
-			application_pointer, synchronization_object_pointer, image_index
-		) == false )
+	if(	vsr_frame_commands_submit(
+			application_pointer, synchronization_frame_pointer, image_index
+		) == false ||
+		vsr_frame_image_present(application_pointer, image_index) == false )
 		return;
 
 	vsr_delay_deletion_process( application_pointer );
 
-	if( ++application_pointer->current_frame >= application_pointer->frames_in_flight_limit )
+	application_pointer->frame_discarded_amount = 0;
+
+	if(	++application_pointer->current_frame >= application_pointer->frames_in_flight_limit )
 		application_pointer->current_frame = 0;
 }
 
-static bool vsr_frame_image_present(
-		struct VSR_Application * restrict application_pointer,
-		const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer,
-		uint32_t image_index
+static VkSemaphore vsr_frame_get_render_finished_semaphore(
+		const struct VSR_Application * restrict application_pointer,
+		uint32_t frame_index, uint32_t image_index
 	)
 {
-	assert_m( application_pointer			!= NULL, "No application found"						);
-	assert_m( synchronization_object_pointer!= NULL, "No synchronization object storage found"	);
+	return application_pointer->render_finished_semaphores_pointer[
+		(application_pointer->capabilities_device.has_swapchain_maintenance_1 == true)
+		? frame_index
+		: image_index
+	];
+}
 
-	if( vsr_frame_fence_present_reset(
-			application_pointer, synchronization_object_pointer
-		) == false )
+static void vsr_frame_render_failed(
+		struct VSR_Application * restrict application_pointer,
+		const char * restrict error_message_pointer
+	)
+{
+	assert_m( application_pointer	!= NULL, "No application found"		);
+	assert_m( error_message_pointer	!= NULL, "No error message found"	);
+
+	woem_push( "%s", error_message_pointer );
+
+	pthread_mutex_lock( &application_pointer->render_mutex );
+	application_pointer->is_running = false;
+	pthread_mutex_unlock( &application_pointer->render_mutex );
+
+	atomic_store_explicit(
+		&application_pointer->is_render_failed, true, memory_order_relaxed
+	);
+	glfwPostEmptyEvent();
+}
+
+static bool vsr_frame_image_present(
+		struct VSR_Application * restrict application_pointer, uint32_t image_index
+	)
+{
+	assert_m( application_pointer != NULL, "No application found" );
+
+	if(	vsr_frame_fence_present_reset(application_pointer) == false )
 		return false;
 
 	VkSwapchainPresentFenceInfoEXT presentation_fence_information = {
 		.sType			= VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT,
 		.swapchainCount	= 1,
-		.pFences		= &synchronization_object_pointer->present_fence
+		.pFences		=
+			&application_pointer->present_fences_pointer[application_pointer->current_frame]
 	};
 
 	VkSemaphore signal_semaphores_array[] = {
-		synchronization_object_pointer->render_finished_semaphore
+		vsr_frame_get_render_finished_semaphore(
+			application_pointer, application_pointer->current_frame, image_index
+		)
 	};
 
 	VkSwapchainKHR swap_chains_array[] = { application_pointer->swap_chain_data.swap_chain };
@@ -2840,9 +3362,18 @@ static bool vsr_frame_image_present(
 	VkResult result = vkQueuePresentKHR(
 		application_pointer->present_queue, &presentation_information
 	);
+	return vsr_frame_image_present_result_handle( application_pointer, result );
+}
+
+static bool vsr_frame_image_present_result_handle(
+		struct VSR_Application * restrict application_pointer, VkResult result
+	)
+{
+	assert_m( application_pointer != NULL, "No application found" );
+
 	switch( result ) {
 	case VK_ERROR_SURFACE_LOST_KHR: {
-		if( vsr_surface_recreate( application_pointer ) == false ) {
+		if(	vsr_surface_recreate( application_pointer ) == false ) {
 			vsr_frame_render_failed(
 				application_pointer, "(vsr_frame_image_present) surface recreation failed"
 			);
@@ -2850,16 +3381,24 @@ static bool vsr_frame_image_present(
 		}
 	/* fall through */
 	case VK_ERROR_OUT_OF_DATE_KHR:
+		if(	vsr_synchronization_fence_present_recreate(application_pointer) == false )
+			return false;
 		atomic_store_explicit(
 			&application_pointer->is_swap_chain_valid, false, memory_order_relaxed
 		);
 	/* fall through */
-	case VK_SUCCESS:
+	case VK_SUCCESS: {
+		return true;
+	}
 	case VK_SUBOPTIMAL_KHR:
+		if(	application_pointer->capabilities_device.has_present_scaling_stretch == false )
+			atomic_store_explicit(
+				&application_pointer->is_swap_chain_valid, false, memory_order_relaxed
+			);
 		return true;
 	}
 	case VK_ERROR_DEVICE_LOST: {
-		if( vsr_device_recreate( application_pointer ) == false )
+		if(	vsr_device_recreate( application_pointer ) == false )
 			vsr_frame_render_failed(
 				application_pointer, "(vsr_frame_image_present) the GPU device has been lost"
 			);
@@ -2874,21 +3413,65 @@ static bool vsr_frame_image_present(
 	}
 }
 
+static bool vsr_synchronization_fence_present_recreate(
+		struct VSR_Application * restrict application_pointer
+	)
+{
+	if(	application_pointer->capabilities_device.has_swapchain_maintenance_1 == false )
+		return true;
+
+	if(	application_pointer->present_fences_pointer != NULL ) {
+		if(	vkQueueWaitIdle(application_pointer->present_queue) != VK_SUCCESS ) {
+			vsr_frame_render_failed(
+				application_pointer,
+				"(vsr_synchronization_fence_present_recreate) present queue wait failed"
+			);
+			return false;
+		}
+		vsr_synchronization_fence_present_destroy(
+			application_pointer->device, application_pointer->present_fences_pointer,
+			application_pointer->frames_in_flight_limit
+		);
+		application_pointer->present_fences_pointer = NULL;
+	}
+
+	const char * error_message_pointer;
+	if((error_message_pointer = vsr_synchronization_fence_present_create(
+			application_pointer, &application_pointer->present_fences_pointer,
+			application_pointer->frames_in_flight_limit
+		)) != NULL )
+	{
+		vsr_frame_render_failed(application_pointer, error_message_pointer);
+		return false;
+	}
+
+	return true;
+}
+
 static bool vsr_frame_image_acquire(
 		struct VSR_Application * restrict application_pointer,
-		const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer,
+		const struct VSR_Synchronization_Frame * restrict synchronization_frame_pointer,
 		uint32_t * restrict out_image_index
 	)
 {
 	assert_m( out_image_index				!= NULL, "No image index found"						);
 	assert_m( application_pointer			!= NULL, "No application found"						);
-	assert_m( synchronization_object_pointer!= NULL, "No synchronization object storage found"	);
+	assert_m( synchronization_frame_pointer!= NULL, "No synchronization object storage found"	);
 
-	while ( true ) {
+	for( uint32_t attempt = 0; attempt < VSR_LIMIT_IMAGE_ACQUIRE_ATTEMPTS; ++attempt ) {
+		pthread_mutex_lock( &application_pointer->render_mutex );
+
+		bool is_minimized = application_pointer->is_minimized;
+
+		pthread_mutex_unlock( &application_pointer->render_mutex );
+
+		if(	is_minimized == true )
+			return false;
+
 		VkResult result = vkAcquireNextImageKHR(
-			application_pointer->device, application_pointer->swap_chain_data.swap_chain, UINT64_MAX,
-			synchronization_object_pointer->image_available_semaphore, VK_NULL_HANDLE,
-			out_image_index
+			application_pointer->device, application_pointer->swap_chain_data.swap_chain,
+			VSR_LIMIT_TIME_WAIT_ACQUIRE, synchronization_frame_pointer->image_available_semaphore,
+			VK_NULL_HANDLE, out_image_index
 		);
 		switch( result ) {
 		case VK_SUCCESS: {
@@ -2896,23 +3479,27 @@ static bool vsr_frame_image_acquire(
 			return true;
 		}
 		case VK_ERROR_OUT_OF_DATE_KHR: {
-			if( vsr_swap_chain_recreate( application_pointer ) == false )
+			if(	vsr_swap_chain_recreate( application_pointer ) == false )
 				return false;
 			break;
 		}
 		case VK_ERROR_SURFACE_LOST_KHR: {
-			if( vsr_surface_recreate( application_pointer ) == false ) {
+			if(	vsr_surface_recreate( application_pointer ) == false ) {
 				vsr_frame_render_failed(
 					application_pointer, "(vsr_frame_image_acquire) surface recreation failed"
 				);
 				return false;
 			}
-			if( vsr_swap_chain_recreate( application_pointer ) == false )
+			if(	vsr_swap_chain_recreate( application_pointer ) == false )
 				return false;
 			break;
 		}
+		case VK_TIMEOUT: {
+			VSR_DEBUG_LOG("(vsr_frame_image_acquire) acquiring frame image timed out");
+			break;
+		}
 		case VK_ERROR_DEVICE_LOST: {
-			if( vsr_device_recreate( application_pointer ) == false )
+			if(	vsr_device_recreate( application_pointer ) == false )
 				vsr_frame_render_failed(
 					application_pointer, "(vsr_frame_image_acquire) the GPU device has been lost"
 				);
@@ -2926,6 +3513,15 @@ static bool vsr_frame_image_acquire(
 		}
 		}
 	}
+
+	VSR_DEBUG_LOG( "(vsr_frame_image_acquire) acquiring frame image failed" );
+
+	if(	vsr_device_recreate(application_pointer) == false )
+		vsr_frame_render_failed(
+			application_pointer,
+			"(vsr_frame_image_acquire) acquiring frame image exceed the limit"
+		);
+	return false;
 }
 
 static bool vsr_surface_recreate(struct VSR_Application * restrict application_pointer) {
@@ -2943,18 +3539,18 @@ static bool vsr_surface_recreate(struct VSR_Application * restrict application_p
 
 static bool vsr_frame_commands_submit(
 		struct VSR_Application * restrict application_pointer,
-		const struct VSR_Synchronization_Objects * restrict synchronization_object_pointer,
+		const struct VSR_Synchronization_Frame * restrict synchronization_frame_pointer,
 		uint32_t image_index
 	)
 {
 	assert_m( application_pointer			!= NULL, "No application found"						);
-	assert_m( synchronization_object_pointer!= NULL, "No synchronization object storage found"	);
+	assert_m( synchronization_frame_pointer	!= NULL, "No synchronization object storage found"	);
 
-	if( vkResetFences(
-			application_pointer->device, 1, &synchronization_object_pointer->in_flight_fence
+	if(	vkResetFences(
+			application_pointer->device, 1, &synchronization_frame_pointer->in_flight_fence
 		) != VK_SUCCESS )
 	{
-		if( vsr_device_recreate(application_pointer) == false )
+		if(	vsr_device_recreate(application_pointer) == false )
 			vsr_frame_render_failed(
 				application_pointer, "(vsr_frame_commands_submit) in-flight fence reset failed"
 			);
@@ -2962,12 +3558,14 @@ static bool vsr_frame_commands_submit(
 	}
 
 	VkSemaphore wait_semaphores_array[] = {
-		synchronization_object_pointer->image_available_semaphore
+		synchronization_frame_pointer->image_available_semaphore
 	};
 	VkPipelineStageFlags wait_stages_array[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
 
 	VkSemaphore signal_semaphores_array[] = {
-		synchronization_object_pointer->render_finished_semaphore
+		vsr_frame_get_render_finished_semaphore(
+			application_pointer, application_pointer->current_frame, image_index
+		)
 	};
 
 	struct VkSubmitInfo submit_information = {
@@ -2982,20 +3580,20 @@ static bool vsr_frame_commands_submit(
 		.pSignalSemaphores		= signal_semaphores_array
 	};
 
-	if( vkQueueSubmit(
+	if(	vkQueueSubmit(
 			application_pointer->graphics_queue, 1, &submit_information,
-			synchronization_object_pointer->in_flight_fence
+			synchronization_frame_pointer->in_flight_fence
 		) != VK_SUCCESS )
 	{
-		if( vkQueueSubmit(
+		if(	vkQueueSubmit(
 				application_pointer->graphics_queue, 0, NULL,
-				synchronization_object_pointer->in_flight_fence
+				synchronization_frame_pointer->in_flight_fence
 			) == VK_SUCCESS )
 		{
 			vsr_frame_discard( application_pointer, image_index );
 			return false;
 		}
-		if( vsr_device_recreate(application_pointer) == false )
+		if(	vsr_device_recreate(application_pointer) == false )
 			vsr_frame_render_failed(
 				application_pointer,
 				"(vsr_frame_commands_submit) draw command buffer submission failed"
@@ -3016,7 +3614,7 @@ static bool vsr_command_buffer_record(
 		.sType				= VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 	};
 
-	if( vkBeginCommandBuffer( command_buffer, &command_buffer_begin_information ) != VK_SUCCESS)
+	if(	vkBeginCommandBuffer( command_buffer, &command_buffer_begin_information ) != VK_SUCCESS)
 	{
 		VSR_DEBUG_LOG("(vsr_command_buffer_record) recording command buffer beginning failed");
 		return false;
@@ -3028,7 +3626,7 @@ static bool vsr_command_buffer_record(
 
 	VkRenderPassAttachmentBeginInfoKHR attachment_begin_information = {
 		.sType				= VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO_KHR,
-		.attachmentCount	= 1,
+		.attachmentCount	= VSR_ATTACHMENT_COLOR_AMOUNT,
 		.pAttachments		= &application_pointer->swap_chain_image_views_pointer[image_index]
 	};
 
@@ -3038,11 +3636,11 @@ static bool vsr_command_buffer_record(
 		.renderArea 		= {
 			.extent	= application_pointer->swap_chain_data.extent
 		},
-		.clearValueCount	= 1, /* values to VK_ATTACHMENT_LOAD_OP_CLEAR */
+		.clearValueCount	= 1,/* values to VK_ATTACHMENT_LOAD_OP_CLEAR */
 		.pClearValues		= &clear_color
 	};
 
-	if( application_pointer->capabilities_device.has_imageless_frame_buffer == true ) {
+	if(	application_pointer->capabilities_device.has_imageless_frame_buffer == true ) {
 		render_pass_information.pNext		= &attachment_begin_information;
 		render_pass_information.framebuffer = application_pointer->swap_chain_data.frame_buffer;
 	} else
@@ -3087,7 +3685,7 @@ static bool vsr_command_buffer_record(
 
 	vkCmdEndRenderPass( command_buffer );
 
-	if( vkEndCommandBuffer( command_buffer ) != VK_SUCCESS ) {
+	if(	vkEndCommandBuffer( command_buffer ) != VK_SUCCESS ) {
 		VSR_DEBUG_LOG( "(vsr_command_buffer_record) command buffer recording failed" );
 		return false;
 	}
@@ -3101,7 +3699,7 @@ static const char * vsr_command_buffers_create(
 {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			&application_pointer->command_buffers_pointer,
 			application_pointer->frames_in_flight_limit,
 			sizeof(*application_pointer->command_buffers_pointer)
@@ -3120,9 +3718,9 @@ static const char * vsr_command_buffers_create(
 	return( vkAllocateCommandBuffers(
 				application_pointer->device, &allocation_information,
 				application_pointer->command_buffers_pointer
-			) == VK_SUCCESS )
-		? NULL
-		: "(vsr_command_buffers_create) command buffer allocation failed";
+			) != VK_SUCCESS )
+		? "(vsr_command_buffers_create) command buffer allocation failed"
+		: NULL;
 }
 
 static const char * vsr_inclusive_command_pool_create(
@@ -3140,7 +3738,7 @@ static const char * vsr_inclusive_command_pool_create(
 		.queueFamilyIndex	= family
 	};
 
-	if( vkCreateCommandPool(
+	if(	vkCreateCommandPool_wrapped(
 			application_pointer->device, &pool_create_information, NULL, command_pool_pointer
 		) != VK_SUCCESS)
 		return "(vsr_inclusive_command_pool_create) command pool creation failed";
@@ -3187,7 +3785,7 @@ static const char * vsr_frame_buffer_create_imaged(
 	uint32_t frames_amount = out_swap_chain_data_pointer->image_views_amount;
 	VkFramebuffer ** frame_buffers_pointer = &out_swap_chain_data_pointer->frame_buffers_pointer;
 
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			frame_buffers_pointer, frames_amount, sizeof(**frame_buffers_pointer)
 		) == false )
 		return "(vsr_frame_buffer_create_imaged) allocation size overflow";
@@ -3199,7 +3797,7 @@ static const char * vsr_frame_buffer_create_imaged(
 		frame_buffer_create_information.pAttachments =
 			&swap_chain_image_views_pointer[frame_buffer_index];
 
-		if( vkCreateFramebuffer(
+		if(	vkCreateFramebuffer(
 				application_pointer->device, &frame_buffer_create_information,
 				NULL, &(*frame_buffers_pointer)[frame_buffer_index]
 			) != VK_SUCCESS )
@@ -3228,7 +3826,7 @@ static const char * vsr_frame_buffer_create(
 	assert_m( out_swap_chain_data_pointer	!= NULL, "No swap chain data storage found"	);
 	assert_m( swap_chain_image_views_pointer!= NULL, "No image views storage found"		);
 
-	/* required by optional imageless framebuffer */
+	/* required by optional imageless frame buffer */
 	out_swap_chain_data_pointer->frame_buffer			= VK_NULL_HANDLE;
 	out_swap_chain_data_pointer->frame_buffers_pointer	= NULL;
 
@@ -3236,13 +3834,13 @@ static const char * vsr_frame_buffer_create(
 		.sType				= VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
 		.renderPass			= application_pointer->render_pass,
 		/* same with render_pass_create_information */
-		.attachmentCount	= 1,
+		.attachmentCount	= VSR_ATTACHMENT_COLOR_AMOUNT,
 		.width				= out_swap_chain_data_pointer->extent.width,
 		.height				= out_swap_chain_data_pointer->extent.height,
 		.layers				= 1
 	};
 
-	if( application_pointer->capabilities_device.has_imageless_frame_buffer == false )
+	if(	application_pointer->capabilities_device.has_imageless_frame_buffer == false )
 		return vsr_frame_buffer_create_imaged(
 			application_pointer, swap_chain_image_views_pointer,
 			out_swap_chain_data_pointer, frame_buffer_create_information
@@ -3265,7 +3863,7 @@ static const char * vsr_frame_buffer_create(
 	frame_buffer_create_information.pNext = &attachment_create_information;
 	frame_buffer_create_information.flags = VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT_KHR;
 
-	return vkCreateFramebuffer(
+	return vkCreateFramebuffer_wrapped(
 				application_pointer->device, &frame_buffer_create_information, NULL,
 				&out_swap_chain_data_pointer->frame_buffer
 			) == VK_SUCCESS
@@ -3280,7 +3878,7 @@ static void vsr_frame_buffer_destroy(
 {
 	assert_m( device != VK_NULL_HANDLE, "No device found" );
 
-	if( frame_buffer != VK_NULL_HANDLE ) {
+	if(	frame_buffer != VK_NULL_HANDLE ) {
 		vkDestroyFramebuffer( device, frame_buffer, NULL );
 		return;
 	}
@@ -3317,7 +3915,7 @@ static const char * vsr_render_pass_create(
 
 	struct VkSubpassDescription subpass = {
 		.pipelineBindPoint		= VK_PIPELINE_BIND_POINT_GRAPHICS,
-		.colorAttachmentCount	= 1,
+		.colorAttachmentCount	= VSR_ATTACHMENT_COLOR_AMOUNT,
 		.pColorAttachments		= &color_attachment_reference
 	};
 
@@ -3330,7 +3928,7 @@ static const char * vsr_render_pass_create(
 
 	struct VkRenderPassCreateInfo render_pass_create_information = {
 		.sType				= VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		.attachmentCount	= 1,
+		.attachmentCount	= VSR_ATTACHMENT_COLOR_AMOUNT,
 		.pAttachments		= &color_attachment,
 		.subpassCount		= 1,
 		.pSubpasses			= &subpass,
@@ -3338,7 +3936,7 @@ static const char * vsr_render_pass_create(
 		.pDependencies		= &dependency
 	};
 
-	return( vkCreateRenderPass(
+	return( vkCreateRenderPass_wrapped(
 				application_pointer->device, &render_pass_create_information, NULL,
 				&application_pointer->render_pass
 			) == VK_SUCCESS )
@@ -3386,20 +3984,23 @@ static const char * vsr_graphics_pipeline_from_shaders_create(
 
 	struct VkVertexInputBindingDescription binding_description = vsr_get_binding_description();
 
-	uint32_t size = 0;
-	const char * error_message_pointer;
-	struct VkVertexInputAttributeDescription * attribute_descriptions_pointer;
-	if((error_message_pointer = vsr_get_attribute_descriptions(
-			&size, &attribute_descriptions_pointer
-		)) != NULL )
-		return error_message_pointer;
+	const struct VkVertexInputAttributeDescription attribute_descriptions_array[2] = {
+		{
+			0 ,0, VK_FORMAT_R32G32_SFLOAT, offsetof(struct VSR_Vertex, position)
+		}, {
+			1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(struct VSR_Vertex, color)
+		}
+	};
+	const uint32_t attribute_descriptions_amount =
+		sizeof(attribute_descriptions_array) / sizeof(*attribute_descriptions_array);
+
 
 	struct VkPipelineVertexInputStateCreateInfo vertex_input_information = {
 		.sType						= VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 		.vertexBindingDescriptionCount		= 1,
 		.pVertexBindingDescriptions			= &binding_description,
-		.vertexAttributeDescriptionCount	= size,
-		.pVertexAttributeDescriptions		= attribute_descriptions_pointer
+		.vertexAttributeDescriptionCount	= attribute_descriptions_amount,
+		.pVertexAttributeDescriptions		= attribute_descriptions_array
 	};
 
 	struct VkPipelineInputAssemblyStateCreateInfo input_assembly = {
@@ -3468,18 +4069,15 @@ static const char * vsr_graphics_pipeline_from_shaders_create(
 		.pSetLayouts			= &application_pointer->descriptor_set_layout
 	};
 
-	struct VkGraphicsPipelineCreateInfo pipeline_create_information;
-
-	if( vkCreatePipelineLayout(
+	if(	vkCreatePipelineLayout_wrapped(
 			application_pointer->device, &pipeline_layout_information, NULL,
 			&application_pointer->pipeline_layout
 		) != VK_SUCCESS )
-	{
-		free( attribute_descriptions_pointer );
 		return "(vsr_graphics_pipeline_from_shaders_create) pipeline layout creation failed";
-	}
 
-	pipeline_create_information = (struct VkGraphicsPipelineCreateInfo) {
+	struct VkGraphicsPipelineCreateInfo pipeline_create_information =
+		(struct VkGraphicsPipelineCreateInfo)
+	{
 		.sType					= VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
 		.stageCount				= 2,
 		.pStages				= shader_stages_information,
@@ -3496,7 +4094,7 @@ static const char * vsr_graphics_pipeline_from_shaders_create(
 		.basePipelineIndex		= -1
 	};
 
-	if( vkCreateGraphicsPipelines(
+	if(	vkCreateGraphicsPipelines(
 			application_pointer->device, VK_NULL_HANDLE, 1, &pipeline_create_information, NULL,
 			&application_pointer->graphics_pipeline
 		) != VK_SUCCESS )
@@ -3505,11 +4103,9 @@ static const char * vsr_graphics_pipeline_from_shaders_create(
 			application_pointer->device, application_pointer->pipeline_layout, NULL
 		);
 		application_pointer->pipeline_layout = VK_NULL_HANDLE;
-		free( attribute_descriptions_pointer );
 		return "(vsr_graphics_pipeline_from_shaders_create) graphics pipeline creation failed";
 	}
 
-	free( attribute_descriptions_pointer );
 	return NULL;
 }
 
@@ -3524,7 +4120,7 @@ static const char * vsr_graphics_pipeline_create(
 	size_t file_size = 0;
 	char * shader_code_vertex = NULL, * shader_code_fragment = NULL;
 
-	if( hf_file_read( "shaders/vertex.spv", &shader_code_vertex, &file_size ) > 0 )
+	if(	hf_file_read( "shaders/vertex.spv", &shader_code_vertex, &file_size ) > 0 )
 		return "(vsr_graphics_pipeline_create) vertex shader code failed to get";
 
 	if((error_message_pointer = vsr_shader_module_create(
@@ -3532,7 +4128,7 @@ static const char * vsr_graphics_pipeline_create(
 		)) != NULL )
 		return error_message_pointer;
 
-	if( hf_file_read( "shaders/fragment.spv", &shader_code_fragment, &file_size ) > 0 ) {
+	if(	hf_file_read( "shaders/fragment.spv", &shader_code_fragment, &file_size ) > 0 ) {
 		error_message_pointer =
 			"(vsr_graphics_pipeline_create) fragment shader code failed to get";
 		goto cleanup_vertex;
@@ -3565,7 +4161,7 @@ static const char * vsr_shader_module_create(
 	assert_m( file_size					> 0,				"No file size found"			);
 	assert_m( out_shader_module_pointer	!= NULL,			"No shader module storage found");
 
-	if( file_size % sizeof(uint32_t) != 0 ) {
+	if(	file_size % sizeof(uint32_t) != 0 ) {
 		free( shader_code_source_pointer );
 		return
 			"(vsr_shader_module_create) "
@@ -3573,7 +4169,7 @@ static const char * vsr_shader_module_create(
 	}
 
 	uint32_t * aligned_shader_source_code_pointer;
-	if( am_aligned_malloc(
+	if(	am_aligned_malloc(
 			&aligned_shader_source_code_pointer, sizeof(*aligned_shader_source_code_pointer),
 			file_size
 		) == false )
@@ -3587,6 +4183,11 @@ static const char * vsr_shader_module_create(
 
 	memcpy( aligned_shader_source_code_pointer, shader_code_source_pointer, file_size );
 	free( shader_code_source_pointer );
+
+	if(	aligned_shader_source_code_pointer[0] != VSR_SPIRV_MAGIC_RECOGNITION_NUMBER ) {
+		am_aligned_free( aligned_shader_source_code_pointer );
+		return "(vsr_shader_module_create) SPIR-V file detection failed";
+	}
 
 	VkShaderModuleCreateInfo create_information = {
 		.sType		= VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -3614,7 +4215,7 @@ static const char * vsr_image_views_create(
 	assert_m( swap_chain_images_pointer			!= NULL, "No swap chain storage found"	);
 	assert_m( out_swap_chain_image_views_pointer!= NULL, "No images storage found"		);
 
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			out_swap_chain_image_views_pointer, swap_chain_image_views_amount,
 			sizeof(**out_swap_chain_image_views_pointer)
 		) == false )
@@ -3622,10 +4223,10 @@ static const char * vsr_image_views_create(
 	else if ( *out_swap_chain_image_views_pointer == NULL )
 		return "(vsr_image_views_create) image views memory allocation failed";
 
-	for ( size_t image = 0; image < swap_chain_image_views_amount; ++image ) {
+	for ( size_t image_index = 0; image_index < swap_chain_image_views_amount; ++image_index ) {
 		VkImageViewCreateInfo create_information = {
 			.sType		= VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			.image		= swap_chain_images_pointer[image],
+			.image		= swap_chain_images_pointer[image_index],
 			.viewType	= VK_IMAGE_VIEW_TYPE_2D,
 			.format		= swap_chain_image_format,
 			.components	= {
@@ -3642,15 +4243,13 @@ static const char * vsr_image_views_create(
 		};
 		if(vkCreateImageView(
 				application_pointer->device, &create_information, NULL,
-				&(*out_swap_chain_image_views_pointer)[image]
+				&(*out_swap_chain_image_views_pointer)[image_index]
 			) != VK_SUCCESS )
 		{
-			for ( uint32_t image_to_delete = 0; image_to_delete < image; ++image_to_delete )
-				vkDestroyImageView(
-					application_pointer->device,
-					(*out_swap_chain_image_views_pointer)[image_to_delete], NULL
-				);
-			free( *out_swap_chain_image_views_pointer );
+			vsr_image_views_destroy(
+				application_pointer->device, *out_swap_chain_image_views_pointer,
+				(uint32_t) image_index
+			);
 			*out_swap_chain_image_views_pointer = NULL;
 			return "(vsr_image_views_create) image views creation failed";
 		}
@@ -3660,12 +4259,21 @@ static const char * vsr_image_views_create(
 }
 
 static inline const char * vsr_swap_chain_support_check(
-		const struct VSR_Swap_Chain_Support_Details * restrict swap_chain_support_pointer
+		const struct VSR_Swap_Chain_Support_Details * restrict swap_chain_support_pointer,
+		const uint32_t image_dimension_2d_maximal
 	)
 {
-	if( swap_chain_support_pointer->surface_capabilities.maxImageExtent.width == 0 ||
-		swap_chain_support_pointer->surface_capabilities.maxImageExtent.height== 0 )
+	const struct VkExtent2D image_extension_maximal =
+		swap_chain_support_pointer->surface_capabilities.maxImageExtent;
+
+	if(	image_extension_maximal.width == 0 ||
+		image_extension_maximal.height== 0 )
 		return "(vsr_swap_chain_support_check) zero surface extent";
+
+	if(	image_extension_maximal.width > image_dimension_2d_maximal ||
+		image_extension_maximal.height> image_dimension_2d_maximal )
+		return "(vsr_swap_chain_support_check) maximal image extension exceeds device limits";
+
 	return
 		swap_chain_support_pointer->formats_amount		== 0 ||
 		swap_chain_support_pointer->present_modes_amount== 0
@@ -3692,7 +4300,9 @@ static const char * vsr_swap_chain_create(
 		)) != NULL )
 		return error_message_pointer;
 
-	if((error_message_pointer = vsr_swap_chain_support_check( &swap_chain_support )) != NULL ) {
+	if((error_message_pointer = vsr_swap_chain_support_check(
+			&swap_chain_support, application_pointer->image_dimension_2d_maximal
+		)) != NULL ) {
 		vsr_swap_chain_support_details_free( &swap_chain_support );
 		return error_message_pointer;
 	}
@@ -3701,11 +4311,12 @@ static const char * vsr_swap_chain_create(
 		swap_chain_support.surface_formats_pointer, swap_chain_support.formats_amount
 	);
 
-	out_swap_chain_data_pointer->extent = vsr_swap_extent_choose(
-		&swap_chain_support.surface_capabilities, application_pointer->window_pointer
+	vsr_swap_chain_extent_write(
+		application_pointer,
+		&out_swap_chain_data_pointer->extent, &swap_chain_support.surface_capabilities
 	);
 
-	if( out_swap_chain_data_pointer->extent.width == 0 ||
+	if(	out_swap_chain_data_pointer->extent.width == 0 ||
 		out_swap_chain_data_pointer->extent.height== 0 )
 	{
 		vsr_swap_chain_support_details_free( &swap_chain_support );
@@ -3723,16 +4334,14 @@ static const char * vsr_swap_chain_create(
 
 	VkSwapchainPresentScalingCreateInfoEXT scaling_create_information = {
 		.sType				= VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_EXT,
-		.scalingBehavior	= VK_PRESENT_SCALING_STRETCH_BIT_EXT,
-		.presentGravityX	= VK_PRESENT_GRAVITY_MIN_BIT_EXT,
-		.presentGravityY	= VK_PRESENT_GRAVITY_MIN_BIT_EXT
+		.scalingBehavior	= VK_PRESENT_SCALING_STRETCH_BIT_EXT
 	};
 
 	VkSwapchainKHR old_swap_chain = application_pointer->swap_chain_data.swap_chain;
 	struct VkSwapchainCreateInfoKHR create_information = {
 		.sType				= VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 		.pNext				=
-			(application_pointer->capabilities_device.has_swapchain_maintenance_1 == true)
+			(application_pointer->capabilities_device.has_present_scaling_stretch == true)
 				? &scaling_create_information
 				: NULL,
 		.surface			= application_pointer->surface,
@@ -3754,7 +4363,7 @@ static const char * vsr_swap_chain_create(
 		application_pointer->queue_family_indices.graphics_family,
 		application_pointer->queue_family_indices.present_family
 	};
-	if( application_pointer->queue_family_indices.graphics_family !=
+	if(	application_pointer->queue_family_indices.graphics_family !=
 		application_pointer->queue_family_indices.present_family )
 	{
 		create_information.imageSharingMode			= VK_SHARING_MODE_CONCURRENT;
@@ -3764,13 +4373,26 @@ static const char * vsr_swap_chain_create(
 		create_information.imageSharingMode			= VK_SHARING_MODE_EXCLUSIVE;
 	}
 
-	if( vkCreateSwapchainKHR(
+	VkResult result = vkCreateSwapchainKHR_wrapped(
+		application_pointer->device, &create_information, NULL,
+		&out_swap_chain_data_pointer->swap_chain
+	);
+
+	/* old swap chain is retired even on fall, trying to create a new one from scratch */
+	if(	result == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR &&
+		create_information.oldSwapchain != VK_NULL_HANDLE )
+	{
+		create_information.oldSwapchain = VK_NULL_HANDLE;
+		result = vkCreateSwapchainKHR_wrapped(
 			application_pointer->device, &create_information, NULL,
 			&out_swap_chain_data_pointer->swap_chain
-		) != VK_SUCCESS )
+		);
+	}
+
+	if(	result != VK_SUCCESS )
 		return "(vsr_swap_chain_create) swap chain failed to create";
 
-	if( vkGetSwapchainImagesKHR(
+	if(	vkGetSwapchainImagesKHR(
 			application_pointer->device, out_swap_chain_data_pointer->swap_chain,
 			&out_swap_chain_data_pointer->image_views_amount, NULL
 		) != VK_SUCCESS )
@@ -3782,7 +4404,7 @@ static const char * vsr_swap_chain_create(
 		goto cleanup;
 	}
 
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			out_swap_chain_images_pointer,
 			out_swap_chain_data_pointer->image_views_amount,
 			sizeof(**out_swap_chain_images_pointer)
@@ -3791,11 +4413,12 @@ static const char * vsr_swap_chain_create(
 		error_message_pointer = "(vsr_swap_chain_create) allocation size overflow";
 		goto cleanup;
 	} else if ( *out_swap_chain_images_pointer == NULL ) {
-		error_message_pointer = "(vsr_swap_chain_create) swap chain images memory allocation failed";
+		error_message_pointer =
+			"(vsr_swap_chain_create) swap chain images memory allocation failed";
 		goto cleanup;
 	}
 
-	if( vkGetSwapchainImagesKHR(
+	if(	vkGetSwapchainImagesKHR(
 			application_pointer->device, out_swap_chain_data_pointer->swap_chain,
 			&out_swap_chain_data_pointer->image_views_amount,
 			*out_swap_chain_images_pointer
@@ -3804,13 +4427,6 @@ static const char * vsr_swap_chain_create(
 		error_message_pointer = "(vsr_swap_chain_create) swap chain images failed to create";
 		goto cleanup_images;
 	}
-
-	glm_lookat(
-		(vec3){ 2.f, 2.f, 2.f },
-		(vec3){ 0.f, 0.f, 0.f },
-		(vec3){ 0.f, 0.f, 1.f },
-		application_pointer->cached_view
-	);
 
 	return NULL;
 
@@ -3824,6 +4440,22 @@ cleanup:
 	);
 	out_swap_chain_data_pointer->swap_chain = VK_NULL_HANDLE;
 	return error_message_pointer;
+}
+
+static inline void vsr_swap_chain_extent_write(
+		struct VSR_Application * restrict application_pointer,
+		struct VkExtent2D * restrict out_extent_pointer,
+		struct VkSurfaceCapabilitiesKHR * restrict out_surface_capabilities_pointer
+	)
+{
+	pthread_mutex_lock(&application_pointer->render_mutex);
+	uint32_t frame_buffer_width = (uint32_t) application_pointer->frame_state.width;
+	uint32_t frame_buffer_height= (uint32_t) application_pointer->frame_state.height;
+	pthread_mutex_unlock(&application_pointer->render_mutex);
+
+	*out_extent_pointer = vsr_swap_extent_choose(
+		out_surface_capabilities_pointer, frame_buffer_width, frame_buffer_height
+	);
 }
 
 static struct VkSurfaceFormatKHR vsr_swap_surface_format_choose(
@@ -3850,22 +4482,15 @@ static struct VkSurfaceFormatKHR vsr_swap_surface_format_choose(
 
 static struct VkExtent2D vsr_swap_extent_choose(
 		const struct VkSurfaceCapabilitiesKHR * restrict surface_capabilities_pointer,
-		GLFWwindow * restrict window_pointer
+		uint32_t frame_buffer_width, uint32_t frame_buffer_height
 	)
 {
-	assert_m( window_pointer				!= NULL, "No window found"						);
-	assert_m( surface_capabilities_pointer	!= NULL, "No surface capabilities list found"	);
+	assert_m( surface_capabilities_pointer != NULL, "No surface capabilities list found" );
 
-	if( surface_capabilities_pointer->currentExtent.width != UINT32_MAX )
+	if(	surface_capabilities_pointer->currentExtent.width != UINT32_MAX )
 		return surface_capabilities_pointer->currentExtent;
 
-	int width, height;
-	glfwGetFramebufferSize( window_pointer, &width, &height );
-
-	struct VkExtent2D extent = {
-		(uint32_t) width,
-		(uint32_t) height
-	};
+	struct VkExtent2D extent = { frame_buffer_width, frame_buffer_height };
 
 	extent.width = (uint32_t) cv_clamp_int64_t(
 		(uint64_t) extent.width,
@@ -3904,7 +4529,7 @@ static bool vsr_instance_create( struct VSR_Application * restrict application_p
 	const char * error_message_pointer = vsr_instance_extensions_check(
 		application_pointer, &extensions
 	);
-	if( error_message_pointer != NULL ) {
+	if(	error_message_pointer != NULL ) {
 		woem_push( "%s", error_message_pointer );
 		return false;
 	}
@@ -3919,7 +4544,7 @@ static bool vsr_instance_create( struct VSR_Application * restrict application_p
 #ifndef NDEBUG
 
 	struct VkDebugUtilsMessengerCreateInfoEXT debug_create_information;
-	if( global_is_validation_layer_supported == true ) {
+	if(	global_is_validation_layer_supported == true ) {
 		vsr_debug_messenger_create_information_populate( &debug_create_information );
 
 		create_information.enabledLayerCount	= (uint32_t) global_validation_layers.amount;
@@ -3932,20 +4557,27 @@ static bool vsr_instance_create( struct VSR_Application * restrict application_p
 
 #endif
 
-	is_instance_created = vkCreateInstance(
+	is_instance_created = vkCreateInstance_wrapped(
 		&create_information, NULL, &application_pointer->instance
 	) == VK_SUCCESS;
 
 	free( extensions.data_pointer );
 
-	if( is_instance_created == false )
+	if(	is_instance_created == false ) {
 		woem_push( "(vsr_instance_create) failed to create instance" );
-	else
-		application_pointer->capabilities_vulkan.get_physical_device_features_2 =
-			(PFN_vkGetPhysicalDeviceFeatures2KHR) vkGetInstanceProcAddr(
-				application_pointer->instance, "vkGetPhysicalDeviceFeatures2KHR" );
+		return false;
+	}
 
-	return is_instance_created;
+	application_pointer->capabilities_vulkan.get_physical_device_features_2 =
+		(PFN_vkGetPhysicalDeviceFeatures2KHR) vkGetInstanceProcAddr(
+			application_pointer->instance, "vkGetPhysicalDeviceFeatures2KHR"
+		);
+	application_pointer->capabilities_vulkan.get_physical_device_surface_capabilities_2 =
+		(PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR) vkGetInstanceProcAddr(
+			application_pointer->instance, "vkGetPhysicalDeviceSurfaceCapabilities2KHR"
+		);
+
+	return true;
 }
 
 static const char * vsr_instance_extensions_check(
@@ -3960,14 +4592,10 @@ static const char * vsr_instance_extensions_check(
 	const char * error_message_pointer = vsr_get_extensions_available(
 		&extensions_available_mutable
 	);
-	if( error_message_pointer != NULL )
+	if(	error_message_pointer != NULL )
 		return error_message_pointer;
-	else if(extensions_available_mutable.amount			== 0	||
-			extensions_available_mutable.data_pointer	== NULL )
-	{
-		free( extensions_available_mutable.data_pointer );
+	else if(extensions_available_mutable.amount == 0 )
 		return "(vsr_instance_extensions_check) no instance extensions available";
-	}
 
 	struct VSR_Extension_Names extensions_required;
 	error_message_pointer = vsr_get_instance_extensions_required( &extensions_required );
@@ -3979,7 +4607,7 @@ static const char * vsr_instance_extensions_check(
 	struct VSR_Extension_Properties extensions_available = vsr_extension_properties_freeze(
 		extensions_available_mutable
 	);
-	if( vsr_instance_extensions_required_check(extensions_required,extensions_available) == false)
+	if(	vsr_instance_extensions_required_check(extensions_required,extensions_available) == false)
 	{
 		free( extensions_available_mutable.data_pointer );
 		return "(vsr_instance_extensions_check) mandatory instance extension missing";
@@ -4005,7 +4633,7 @@ static const char * vsr_instance_extensions_check(
 }
 
 static bool vsr_device_capabilities_build(
-		VkPhysicalDevice device,
+		VkPhysicalDevice device, VkSurfaceKHR surface,
 		const struct VSR_Capabilities_Vulkan * restrict instance_capabilities_pointer,
 		struct VSR_Capabilities_Device * restrict out_capabilities_device_pointer
 	)
@@ -4016,7 +4644,7 @@ static bool vsr_device_capabilities_build(
 	struct VkExtensionProperties extensions_array[VSR_LIMIT_STACK_EXTENSIONS];
 	struct VSR_Extension_Properties_Mutable extensions_data;
 
-	if( vsr_device_extensions_get(device, extensions_array, &extensions_data) == false )
+	if(	vsr_device_extensions_get(device, extensions_array, &extensions_data) == false )
 		return false;
 
 	struct VSR_Extension_Properties extensions_available = vsr_extension_properties_freeze(
@@ -4026,7 +4654,7 @@ static bool vsr_device_capabilities_build(
 		global_device_extensions_required, extensions_available
 	);
 
-	if( has_extensions_required == true ) {
+	if(	has_extensions_required == true ) {
 		struct VSR_Extension_Group groups_extension_array[VSR_EXTENSION_GROUPS_AMOUNT_DEVICE];
 		vsr_device_extensions_groups_fill(
 			out_capabilities_device_pointer, groups_extension_array
@@ -4038,25 +4666,34 @@ static bool vsr_device_capabilities_build(
 			},
 			extensions_available
 		);
-		
-		if( instance_capabilities_pointer->has_get_physical_device_properties_2 == true ) {
+
+		if(	instance_capabilities_pointer->has_get_physical_device_properties_2 == true ) {
 			struct VSR_Capabilities_Device features_device;
 			vsr_device_extension_required_check(
 				device, instance_capabilities_pointer->get_physical_device_features_2,
 				&features_device
 			);
-			if( instance_capabilities_pointer->has_surface_maintenance_1			== false ||
-				features_device.has_swapchain_maintenance_1							== false )
-				out_capabilities_device_pointer->has_swapchain_maintenance_1		= false;
+			if(	instance_capabilities_pointer->has_surface_maintenance_1		== false ||
+				features_device.has_swapchain_maintenance_1						== false )
+			{
+				out_capabilities_device_pointer->has_swapchain_maintenance_1	= false;
+				out_capabilities_device_pointer->has_present_scaling_stretch	= false;
+			}
+			else {
+				out_capabilities_device_pointer->has_present_scaling_stretch	=
+					vsr_device_present_scaling_stretch_check(
+						device, surface, instance_capabilities_pointer
+					);
+			}
 
-			if( features_device.has_imageless_frame_buffer							== false )
-				out_capabilities_device_pointer->has_imageless_frame_buffer			= false;
+			if(	features_device.has_imageless_frame_buffer						== false )
+				out_capabilities_device_pointer->has_imageless_frame_buffer		= false;
 		} else {
 			*out_capabilities_device_pointer = (struct VSR_Capabilities_Device) { 0 };
 		}
 	}
 
-	if( extensions_data.data_pointer != extensions_array )
+	if(	extensions_data.data_pointer != extensions_array )
 		free( extensions_data.data_pointer );
 
 	return has_extensions_required;
@@ -4111,7 +4748,7 @@ static inline bool vsr_extensions_available_check(
 		for(uint32_t extension_index_available = 0;
 				extension_index_available < available.amount; ++extension_index_available)
 		{
-			if( strcmp(
+			if(	strcmp(
 					required.data_pointer[extension_index_check],
 					available.data_pointer[extension_index_available].extensionName
 				) == 0 )
@@ -4120,7 +4757,7 @@ static inline bool vsr_extensions_available_check(
 				break;
 			}
 		}
-		if( found == false ) {
+		if(	found == false ) {
 			VSR_DEBUG_LOGF(
 				"(vsr_extensions_available_check) Warning: missing extension: %s",
 				required.data_pointer[extension_index_check]
@@ -4161,17 +4798,17 @@ static const char * vsr_get_extensions_available(
 {
 	assert_m( out_extensions_pointer != NULL, "No extensions storage found" );
 
-	if( vkEnumerateInstanceExtensionProperties(
+	if(	vkEnumerateInstanceExtensionProperties(
 			NULL, &out_extensions_pointer->amount, NULL
 		) != VK_SUCCESS )
 		return
 			"(vsr_get_extensions_available) "
 			"Vulkan Enumeration the Number of Instance Extension Properties failed";
 
-	if( out_extensions_pointer->amount == 0 )
+	if(	out_extensions_pointer->amount == 0 )
 		return NULL;
 
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			&out_extensions_pointer->data_pointer, out_extensions_pointer->amount,
 			sizeof(*out_extensions_pointer->data_pointer)
 		) == false )
@@ -4179,7 +4816,7 @@ static const char * vsr_get_extensions_available(
 	else if ( out_extensions_pointer->data_pointer == NULL )
 		return "(vsr_get_extensions_available) Vulkan Extension Properties allocation failed";
 
-	if( vkEnumerateInstanceExtensionProperties(
+	if(	vkEnumerateInstanceExtensionProperties(
 			NULL, &out_extensions_pointer->amount, out_extensions_pointer->data_pointer
 		) != VK_SUCCESS )
 	{
@@ -4203,7 +4840,7 @@ static void vsr_extensions_groups_availability(
 		*groups.data_pointer[group_index].is_available_pointer =
 			vsr_extensions_available_check(
 				groups.data_pointer[group_index].names, extensions_available
-			);			
+			);
 }
 
 static const char * vsr_instance_extensions_all_build(
@@ -4224,12 +4861,12 @@ static const char * vsr_instance_extensions_all_build(
 
 #ifndef NDEBUG
 
-	if( global_is_validation_layer_supported == true )
+	if(	global_is_validation_layer_supported == true )
 		++out_extensions_pointer->amount;
 
 #endif
 
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			&out_extensions_pointer->data_pointer, out_extensions_pointer->amount,
 			sizeof(*out_extensions_pointer->data_pointer)
 		) == false )
@@ -4248,7 +4885,7 @@ static const char * vsr_instance_extensions_all_build(
 			group_index < VSR_EXTENSION_GROUPS_AMOUNT_INSTANCE;
 				++group_index )
 	{
-		if( *out_groups_extension_array[group_index].is_available_pointer == false )
+		if(	*out_groups_extension_array[group_index].is_available_pointer == false )
 			continue;
 		memcpy(
 			out_extensions_pointer->data_pointer + out_extensions_pointer->amount,
@@ -4261,7 +4898,7 @@ static const char * vsr_instance_extensions_all_build(
 
 #ifndef NDEBUG
 
-	if( global_is_validation_layer_supported == true )
+	if(	global_is_validation_layer_supported == true )
 		out_extensions_pointer->data_pointer[out_extensions_pointer->amount++] =
 			VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
 
@@ -4312,16 +4949,16 @@ static void vsr_instance_extensions_groups_fill(
 
 #ifndef NDEBUG
 static bool vsr_validation_layer_support_check(void) {
-	if( global_validation_layers.amount == 0 )
+	if(	global_validation_layers.amount == 0 )
 		return true;
 
 	uint32_t instance_layers_amount;
 	VkResult result = vkEnumerateInstanceLayerProperties( &instance_layers_amount, NULL );
-	if( result != VK_SUCCESS )
+	if(	result != VK_SUCCESS )
 		return false;
 
 	struct VkLayerProperties * available_layers_pointer;
-	if( sa_malloc_array(
+	if(	sa_malloc_array(
 			&available_layers_pointer, instance_layers_amount, sizeof(*available_layers_pointer)
 		) == false )
 	{
@@ -4336,7 +4973,7 @@ static bool vsr_validation_layer_support_check(void) {
 	result = vkEnumerateInstanceLayerProperties(
 		&instance_layers_amount, available_layers_pointer
 	);
-	if( result != VK_SUCCESS ) {
+	if(	result != VK_SUCCESS ) {
 		free( available_layers_pointer );
 		return false;
 	}
@@ -4346,7 +4983,7 @@ static bool vsr_validation_layer_support_check(void) {
 		for ( uint32_t instance_layer_index = 0;
 				instance_layers_amount > instance_layer_index; ++instance_layer_index )
 		{
-			if( strcmp(
+			if(	strcmp(
 					global_validation_layers.data_pointer[validation_layer_index],
 					available_layers_pointer[instance_layer_index].layerName
 				) == 0 )
@@ -4355,7 +4992,7 @@ static bool vsr_validation_layer_support_check(void) {
 				break;
 			}
 		}
-		if( validation_layer_found == false ) {
+		if(	validation_layer_found == false ) {
 			free( available_layers_pointer );
 			return false;
 		}
@@ -4368,14 +5005,14 @@ static VkResult vsr_debug_utils_messenger_extension_create(
 		VkInstance instance,
 		const VkDebugUtilsMessengerCreateInfoEXT * restrict create_information_pointer,
 		VkDebugUtilsMessengerEXT * restrict debug_messenger_pointer
-	) 
+	)
 {
 	assert_m( create_information_pointer!= NULL,"No debug messenger creation information found"	);
 	assert_m( debug_messenger_pointer	!= NULL,"No debug messenger found"						);
 
-	PFN_vkCreateDebugUtilsMessengerEXT function = (PFN_vkCreateDebugUtilsMessengerEXT) 
+	PFN_vkCreateDebugUtilsMessengerEXT function = (PFN_vkCreateDebugUtilsMessengerEXT)
 		vkGetInstanceProcAddr( instance, "vkCreateDebugUtilsMessengerEXT" );
-	if( function != NULL )
+	if(	function != NULL )
 		return function(
 			instance, create_information_pointer, NULL, debug_messenger_pointer
 		);
@@ -4389,7 +5026,7 @@ static void vsr_debug_utils_messenger_extension_destroy(
 {
 	PFN_vkDestroyDebugUtilsMessengerEXT function_pointer = (PFN_vkDestroyDebugUtilsMessengerEXT)
 		vkGetInstanceProcAddr( instance, "vkDestroyDebugUtilsMessengerEXT" );
-	if( function_pointer != NULL )
+	if(	function_pointer != NULL )
 		function_pointer( instance, debug_messenger, NULL );
 }
 
@@ -4425,9 +5062,9 @@ static void vsr_debug_messenger_create_information_populate(
 	);
 
 	*creation_information_pointer = (struct VkDebugUtilsMessengerCreateInfoEXT) {
-		.sType = 
+		.sType =
 			VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-		.messageSeverity = 
+		.messageSeverity =
 			VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT	|
 			VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT	|
 			VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
@@ -4438,12 +5075,51 @@ static void vsr_debug_messenger_create_information_populate(
 		.pfnUserCallback = vsr_debug_callback_function
 	};
 }
+
+static void vsr_debug_gpu_print(
+		VkPhysicalDeviceProperties device_properties,
+		struct VSR_Capabilities_Device capabilities_device, uint32_t scores
+	)
+{
+	VSR_DEBUG_LOGF(
+		"\nGPU candidate: %s \ntype: %s \nidentification number %d\n"
+		"scores: %u \nmaintenance: %s \nstretch: %s \nimageless: %s",
+		device_properties.deviceName,
+		vsr_debug_device_type_print(device_properties.deviceType), device_properties.deviceID,
+		scores, vsr_debug_maintainability_print(capabilities_device.has_swapchain_maintenance_1),
+		vsr_debug_maintainability_print(capabilities_device.has_present_scaling_stretch),
+		vsr_debug_maintainability_print(capabilities_device.has_imageless_frame_buffer)
+	);
+}
+
+static inline const char * vsr_debug_device_type_print(const VkPhysicalDeviceType device_type) {
+	switch( device_type ) {
+	case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+		return "integrated";
+	case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+		return "discrete";
+	case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+		return "virtual";
+	case VK_PHYSICAL_DEVICE_TYPE_OTHER:
+		return "other";
+	case VK_PHYSICAL_DEVICE_TYPE_CPU:
+		return "central processing unit";
+	default:
+		return "unknown";
+	}
+}
+
+static inline const char * vsr_debug_maintainability_print(bool flag) {
+	return (flag == true) ? "supported" : "unsupported";
+}
 #endif
 
 static bool vsr_window_initialize( struct VSR_Application * restrict application_pointer ) {
 	assert_m( application_pointer != NULL, "No application found" );
 
-	if( glfwInit() != GLFW_TRUE ) {
+	glfwSetErrorCallback( vsr_callback_glfw_error );
+
+	if(	glfwInit() != GLFW_TRUE ) {
 		woem_push( "(vsr_window_initialize) GLFW initialization failed" );
 		return false;
 	}
@@ -4453,23 +5129,30 @@ static bool vsr_window_initialize( struct VSR_Application * restrict application
 	application_pointer->window_pointer = glfwCreateWindow(
 		VSR_WINDOW_WIDTH, VSR_WINDOW_HEIGHT, "VULKAN SQUARE ROTATION", NULL, NULL
 	);
-	if( application_pointer->window_pointer == NULL ) {
+	if(	application_pointer->window_pointer == NULL ) {
 		woem_push( "(vsr_window_initialize) window creation failed" );
 		glfwTerminate();
 		return false;
 	}
 
+	int frame_buffer_width, frame_buffer_height;
+	glfwGetFramebufferSize(
+		application_pointer->window_pointer, &frame_buffer_width, &frame_buffer_height
+	);
+	application_pointer->frame_state.width = frame_buffer_width;
+	application_pointer->frame_state.height= frame_buffer_height;
+
 	glfwSetWindowUserPointer(
 		application_pointer->window_pointer, application_pointer
 	);
 	glfwSetKeyCallback(
-		application_pointer->window_pointer, vsr_callback_key
+		application_pointer->window_pointer, vsr_callback_glfw_key
 	);
 	glfwSetWindowIconifyCallback(
-		application_pointer->window_pointer, vsr_callback_window_iconify
+		application_pointer->window_pointer, vsr_callback_glfw_window_iconify
 	);
 	glfwSetFramebufferSizeCallback(
-		application_pointer->window_pointer, vsr_callback_frame_buffer_size
+		application_pointer->window_pointer, vsr_callback_glfw_frame_buffer_size
 	);
 
 	application_pointer->is_initialized_glfw = true;
@@ -4477,7 +5160,7 @@ static bool vsr_window_initialize( struct VSR_Application * restrict application
 	return true;
 }
 
-static void vsr_callback_window_iconify( GLFWwindow * window_pointer, int iconified ) {
+static void vsr_callback_glfw_window_iconify( GLFWwindow * window_pointer, int iconified ) {
 	struct VSR_Application * application_pointer = glfwGetWindowUserPointer( window_pointer );
 
 	pthread_mutex_lock( &application_pointer->render_mutex );
@@ -4488,23 +5171,26 @@ static void vsr_callback_window_iconify( GLFWwindow * window_pointer, int iconif
 	pthread_mutex_unlock( &application_pointer->render_mutex );
 }
 
-static void vsr_callback_key(
+static void vsr_callback_glfw_key(
 		GLFWwindow * window_pointer, int key, int scancode, int action, int mods
 	)
 {
 	(void) mods; (void) scancode;
-	if( action == GLFW_PRESS && key == GLFW_KEY_ESCAPE )
+	if(	action == GLFW_PRESS && key == GLFW_KEY_ESCAPE )
 		glfwSetWindowShouldClose( window_pointer, GLFW_TRUE );
 }
 
-static void vsr_callback_frame_buffer_size(GLFWwindow * window_pointer, int width, int height) {
+static void vsr_callback_glfw_frame_buffer_size(
+		GLFWwindow * window_pointer, int width, int height
+	)
+{
 	struct VSR_Application * application_pointer = glfwGetWindowUserPointer( window_pointer );
 
 	pthread_mutex_lock( &application_pointer->render_mutex );
 
 	application_pointer->frame_state.width	= width;
 	application_pointer->frame_state.height	= height;
-	if( width != 0 && height != 0 ) {
+	if(	width > 0 && height > 0 ) {
 		application_pointer->is_minimized					= false;
 		application_pointer->frame_state.is_projection_dirty= true;
 		application_pointer->frame_state.is_resize_pending	= true;
@@ -4514,7 +5200,7 @@ static void vsr_callback_frame_buffer_size(GLFWwindow * window_pointer, int widt
 		);
 		uint32_t extent_width = (uint32_t)(extent_packed >> 32);
 		uint32_t extent_height= (uint32_t)(extent_packed & UINT32_MAX);
-		if( (uint32_t) width > extent_width * VSR_RESIZE_INVALID_FACTOR ||
+		if(	(uint32_t) width > extent_width * VSR_RESIZE_INVALID_FACTOR ||
 			(uint32_t) height> extent_height* VSR_RESIZE_INVALID_FACTOR )
 			atomic_store_explicit(
 				&application_pointer->is_swap_chain_valid, false, memory_order_relaxed
@@ -4526,20 +5212,6 @@ static void vsr_callback_frame_buffer_size(GLFWwindow * window_pointer, int widt
 	pthread_mutex_unlock( &application_pointer->render_mutex );
 }
 
-static void vsr_frame_render_failed(
-		struct VSR_Application * restrict application_pointer,
-		const char * restrict error_message_pointer
-	)
-{
-	assert_m( application_pointer	!= NULL, "No application found"		);
-	assert_m( error_message_pointer	!= NULL, "No error message found"	);
-
-	woem_push( "%s", error_message_pointer );
-
-	pthread_mutex_lock( &application_pointer->render_mutex );
-	application_pointer->is_running = false;
-	pthread_mutex_unlock( &application_pointer->render_mutex );
-
-	glfwSetWindowShouldClose( application_pointer->window_pointer, GLFW_TRUE );
-	glfwPostEmptyEvent();
+static void vsr_callback_glfw_error(int error_code, const char * description_pointer) {
+	VSR_DEBUG_LOGF("(vsr_callback_glfw_error) error (%d): %s", error_code, description_pointer);
 }
