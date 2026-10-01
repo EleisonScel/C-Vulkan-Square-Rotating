@@ -446,8 +446,9 @@ static bool vsr_device_recreate(struct VSR_Application * restrict application_po
 /* choose a swap chain part */
 static void vsr_swap_chain_support_details_free(struct VSR_Swap_Chain_Support_Details * restrict swap_chain_support_pointer);
 static inline void vsr_swap_chain_extent_write(struct VSR_Application * restrict application_pointer, struct VkExtent2D * restrict out_extent_pointer, struct VkSurfaceCapabilitiesKHR * restrict out_surface_capabilities_pointer);
-static const char * vsr_swap_chain_create(struct VSR_Application * restrict application_pointer, struct VSR_Swap_Chain_Data * restrict out_swap_chain_data_pointer, VkImage ** restrict out_swap_chain_images_pointer);
+static const char * vsr_swap_chain_create(struct VSR_Application * restrict application_pointer, VkSwapchainKHR old_swap_chain, struct VSR_Swap_Chain_Data * restrict out_swap_chain_data_pointer, VkImage ** restrict out_swap_chain_images_pointer);
 static const char * vsr_swap_chain_support_query(VkSurfaceKHR surface, VkPhysicalDevice device, struct VSR_Swap_Chain_Support_Details * restrict out_swap_chain_support_details_pointer);
+static VkCompositeAlphaFlagBitsKHR vsr_swap_chain_surface_composite_alpha(const struct VkSurfaceCapabilitiesKHR * restrict surface_capabilities);
 static struct VkExtent2D vsr_swap_extent_choose(const struct VkSurfaceCapabilitiesKHR * restrict surface_capabilities_pointer, uint32_t frame_buffer_width, uint32_t frame_buffer_height);
 static struct VkSurfaceFormatKHR vsr_swap_surface_format_choose(const struct VkSurfaceFormatKHR * restrict available_formats_pointer, size_t available_formats_amount);
 static inline const char * vsr_swap_chain_support_check(const struct VSR_Swap_Chain_Support_Details * restrict swap_chain_support_pointer, const uint32_t image_dimension_2d_maximal);
@@ -643,7 +644,8 @@ static const char * vsr_device_resources_create(
 
 	if(	(error_message_pointer = vsr_delay_deletion_initialize(application_pointer)) != NULL ||
 		(error_message_pointer = vsr_swap_chain_create(
-			application_pointer, &application_pointer->swap_chain_data, &swap_chain_images_pointer
+			application_pointer, VK_NULL_HANDLE,
+			&application_pointer->swap_chain_data, &swap_chain_images_pointer
 		)) != NULL )
 		return error_message_pointer;
 
@@ -963,17 +965,21 @@ static void vsr_device_and_resources_destroy(
 			application_pointer, application_pointer->frames_in_flight_limit
 		);
 
-	if(	application_pointer->render_finished_semaphores_pointer != NULL )
+	if(	application_pointer->render_finished_semaphores_pointer != NULL ) {
 		vsr_synchronization_semaphores_render_finished_destroy(
 			application_pointer->device, application_pointer->render_finished_semaphores_pointer,
 			application_pointer->render_finished_semaphores_amount
 		);
+		application_pointer->render_finished_semaphores_pointer = NULL;
+	}
 
-	if(	application_pointer->present_fences_pointer != NULL )
+	if(	application_pointer->present_fences_pointer != NULL ) {
 		vsr_synchronization_fence_present_destroy(
 			application_pointer->device, application_pointer->present_fences_pointer,
 			application_pointer->frames_in_flight_limit
 		);
+		application_pointer->present_fences_pointer = NULL;
+	}
 
 	if(	application_pointer->command_pool_graphic != VK_NULL_HANDLE ) {
 		vkDestroyCommandPool(
@@ -1152,8 +1158,8 @@ static void vsr_deletion_entity_destroy(
 		entity_pointer->image_views_amount
 	);
 
+	/* on surface lost and device recreate swap chain may be VK_NULL_HANDLE */
 	vkDestroySwapchainKHR(application_pointer->device, entity_pointer->swap_chain, NULL);
-
 
 	if(	entity_pointer->render_finished_semaphores_pointer != NULL )
 		vsr_synchronization_semaphores_render_finished_destroy(
@@ -1166,7 +1172,9 @@ static void vsr_image_views_destroy(
 		VkDevice device, VkImageView * restrict image_views_pointer, uint32_t image_views_amount
 	)
 {
-	assert_m( image_views_pointer != NULL, "No image views found" );
+	/* in case of surface lose or device recreate, if the swap chain was already destroyed */
+	if( image_views_pointer == NULL )
+		return;
 
 	for(uint32_t image_view_index = 0; image_view_index < image_views_amount; ++image_view_index)
 		vkDestroyImageView( device, image_views_pointer[image_view_index], NULL );
@@ -2048,17 +2056,22 @@ static struct VkVertexInputBindingDescription vsr_get_binding_description(void) 
 	return binding_description;
 }
 
+/* function SHALL be called only under the mutex lock */
 static bool vsr_swap_chain_is_extent_needs_update(
 		struct VSR_Application * restrict application_pointer
 	)
 {
 	VkSurfaceCapabilitiesKHR capabilities;
-	if(	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
-			application_pointer->device_physical, application_pointer->surface, &capabilities
-		) != VK_SUCCESS )
+
+	pthread_mutex_unlock( &application_pointer->render_mutex );
+	VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+		application_pointer->device_physical, application_pointer->surface, &capabilities
+	);
+	pthread_mutex_lock( &application_pointer->render_mutex );
+
+	if( result != VK_SUCCESS )
 		return true;
 
-	/* under external mutex */
 	struct VkExtent2D current_extent = (capabilities.currentExtent.width != UINT32_MAX)
 		? capabilities.currentExtent
 		: vsr_swap_extent_choose(
@@ -2104,9 +2117,18 @@ static bool vsr_swap_chain_recreate_data(struct VSR_Application * restrict appli
 	const char					* error_message_pointer;
 
 	if((error_message_pointer = vsr_swap_chain_create(
-			application_pointer, &new_swap_chain_data, &swap_chain_images_pointer
-		)) != NULL )
+			application_pointer, application_pointer->swap_chain_data.swap_chain,
+			&new_swap_chain_data, &swap_chain_images_pointer
+		)) != NULL ) {
+		if( application_pointer->swap_chain_data.swap_chain != VK_NULL_HANDLE )
+		{
+			vsr_swap_chain_cleanup( application_pointer );
+			atomic_store_explicit(
+				&application_pointer->is_swap_chain_valid, false, memory_order_relaxed
+			);
+		}
 		goto cleanup;
+	}
 
 	VkImageView * swap_chain_image_views_pointer_new;
 	if((error_message_pointer = vsr_image_views_create(
@@ -2483,18 +2505,21 @@ static const char * vsr_queue_families_find(
 	);
 
 	struct VSR_Queue_Family_Indices indices = { 0 };
-	for ( uint32_t queue_family_index = 0;
-			queue_family_index < queue_families_amount; ++queue_family_index )
+	for(uint32_t queue_family_index = 0;
+			queue_family_index < queue_families_amount;
+				++queue_family_index )
 	{
-		if(	queue_families_pointer[queue_family_index].queueFlags & VK_QUEUE_GRAPHICS_BIT ) {
+		if(	(queue_families_pointer[queue_family_index].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0 )
+		{
 			indices.graphics_family = queue_family_index;
 			indices.has_graphics_family = true;
 		}
 
+		if( indices.has_present_family == false ) {
 			VkBool32 present_family_supported = false;
 			if(vkGetPhysicalDeviceSurfaceSupportKHR(
 					device, queue_family_index, surface, &present_family_supported
-				) != VK_SUCCESS)
+				) != VK_SUCCESS )
 			{
 				if(	memory_was_dynamically_allocated == true )
 					free( queue_families_pointer );
@@ -2504,20 +2529,21 @@ static const char * vsr_queue_families_find(
 				indices.present_family = queue_family_index;
 				indices.has_present_family = true;
 			}
+		}
 
-			if((queue_families_pointer[queue_family_index].queueFlags & VK_QUEUE_TRANSFER_BIT)!= 0)
+		if((queue_families_pointer[queue_family_index].queueFlags & VK_QUEUE_TRANSFER_BIT) != 0 )
+		{
+			if(	(queue_families_pointer[queue_family_index].queueFlags &
+					(VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT )) == 0 )
 			{
-				if(	(queue_families_pointer[queue_family_index].queueFlags &
-						(VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT )) == 0 )
-				{
-					indices.transfer_family = queue_family_index;
-					indices.has_transfer_family = true;
-				}
+				indices.transfer_family = queue_family_index;
+				indices.has_transfer_family = true;
 			}
+		}
 
-			if(	vsr_queue_family_indices_is_complete( &indices )== true &&
-				indices.has_transfer_family == true )
-				break;
+		if(	vsr_queue_family_indices_is_complete( &indices ) == true &&
+			indices.has_transfer_family == true )
+			break;
 	}
 	if(	memory_was_dynamically_allocated == true )
 		free( queue_families_pointer );
@@ -3885,7 +3911,10 @@ static void vsr_frame_buffer_destroy(
 		return;
 	}
 
-	assert_m( frame_buffers_pointer != NULL, "No frame buffers storage found" );
+	/* in case of surface lose or device recreate, if the swap chain was already destroyed */
+	if( frame_buffers_pointer == NULL )
+		return;
+
 	for(uint32_t frame_buffer_index = 0;
 			frame_buffer_index < frame_buffer_amount;
 				++frame_buffer_index )
@@ -3995,7 +4024,6 @@ static const char * vsr_graphics_pipeline_from_shaders_create(
 	};
 	const uint32_t attribute_descriptions_amount =
 		sizeof(attribute_descriptions_array) / sizeof(*attribute_descriptions_array);
-
 
 	struct VkPipelineVertexInputStateCreateInfo vertex_input_information = {
 		.sType						= VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -4285,6 +4313,7 @@ static inline const char * vsr_swap_chain_support_check(
 
 static const char * vsr_swap_chain_create(
 		struct VSR_Application * restrict application_pointer,
+		VkSwapchainKHR old_swap_chain,
 		struct VSR_Swap_Chain_Data * restrict out_swap_chain_data_pointer,
 		VkImage ** restrict out_swap_chain_images_pointer
 	)
@@ -4339,7 +4368,10 @@ static const char * vsr_swap_chain_create(
 		.scalingBehavior	= VK_PRESENT_SCALING_STRETCH_BIT_EXT
 	};
 
-	VkSwapchainKHR old_swap_chain = application_pointer->swap_chain_data.swap_chain;
+	VkCompositeAlphaFlagBitsKHR composite_alpha = vsr_swap_chain_surface_composite_alpha(
+		&swap_chain_support.surface_capabilities
+	);
+
 	struct VkSwapchainCreateInfoKHR create_information = {
 		.sType				= VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 		.pNext				=
@@ -4354,7 +4386,7 @@ static const char * vsr_swap_chain_create(
 		.imageArrayLayers	= 1,/* image consists of this amount of layers */
 		.imageUsage			= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 		.preTransform		= swap_chain_support.surface_capabilities.currentTransform,
-		.compositeAlpha		= VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+		.compositeAlpha		= composite_alpha,
 		.presentMode		= VK_PRESENT_MODE_FIFO_KHR,
 		.clipped			= VK_TRUE,
 		.oldSwapchain		= old_swap_chain
@@ -4442,6 +4474,32 @@ cleanup:
 	);
 	out_swap_chain_data_pointer->swap_chain = VK_NULL_HANDLE;
 	return error_message_pointer;
+}
+
+static VkCompositeAlphaFlagBitsKHR vsr_swap_chain_surface_composite_alpha(
+		const struct VkSurfaceCapabilitiesKHR * restrict surface_capabilities
+	)
+{
+	static const VkCompositeAlphaFlagBitsKHR composite_alpha_candidates_array[] = {
+		VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+		VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+		VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+		VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+	};
+	const size_t composite_alpha_candidates_amount =
+		sizeof(composite_alpha_candidates_array) / sizeof(*composite_alpha_candidates_array);
+
+	for(size_t composite_alpha_index = 0;
+			composite_alpha_index < composite_alpha_candidates_amount;
+				++composite_alpha_index )
+	{
+		if((surface_capabilities->supportedCompositeAlpha &
+			composite_alpha_candidates_array[composite_alpha_index]) != 0 )
+			return composite_alpha_candidates_array[composite_alpha_index];
+	}
+
+	assert_m( 0, "Nothing supported composite alpha mode found" );
+	return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 }
 
 static inline void vsr_swap_chain_extent_write(
@@ -5123,6 +5181,15 @@ static bool vsr_window_initialize( struct VSR_Application * restrict application
 
 	if(	glfwInit() != GLFW_TRUE ) {
 		woem_push( "(vsr_window_initialize) GLFW initialization failed" );
+		return false;
+	}
+
+	if( glfwVulkanSupported() != GLFW_TRUE ) {
+		woem_push(
+			"(vsr_window_initialize) "
+			"Vulkan loader not found or no installed client driver available"
+		);
+		glfwTerminate();
 		return false;
 	}
 
