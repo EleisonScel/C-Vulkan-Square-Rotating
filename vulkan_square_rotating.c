@@ -3199,7 +3199,7 @@ static VkResult vsr_frame_fences_wait(
 	)
 {
 	assert_m( application_pointer			!= NULL, "No application found"						);
-	assert_m( synchronization_frame_pointer!= NULL, "No synchronization object storage found"	);
+	assert_m( synchronization_frame_pointer	!= NULL, "No synchronization object storage found"	);
 
 	if(	application_pointer->capabilities_device.has_swapchain_maintenance_1 == true )
 		return vkWaitForFences(
