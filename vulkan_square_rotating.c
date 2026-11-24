@@ -3484,7 +3484,7 @@ static bool vsr_frame_image_acquire(
 {
 	assert_m( out_image_index				!= NULL, "No image index found"						);
 	assert_m( application_pointer			!= NULL, "No application found"						);
-	assert_m( synchronization_frame_pointer!= NULL, "No synchronization object storage found"	);
+	assert_m( synchronization_frame_pointer	!= NULL, "No synchronization object storage found"	);
 
 	for( uint32_t attempt = 0; attempt < VSR_LIMIT_IMAGE_ACQUIRE_ATTEMPTS; ++attempt ) {
 		pthread_mutex_lock( &application_pointer->render_mutex );
